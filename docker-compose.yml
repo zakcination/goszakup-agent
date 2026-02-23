@@ -1,0 +1,116 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# goszakup-agent · docker-compose.yml · Spiral 1
+#
+# Spiral 1: postgres + adminer (DB UI) + redis
+# Spiral 2 will add: etl_service, analytics_api
+# Spiral 3 will add: milvus, agent_api
+# Spiral 4 will add: nginx, airflow, prometheus, grafana
+#
+# Usage:
+#   cp .env.example .env && nano .env   # fill secrets
+#   docker compose up -d
+#   docker compose logs -f postgres     # watch init
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: goszakup-agent
+
+# ── Networks (isolated zones) ──────────────────────────────────────────────────
+networks:
+  data_net:       # postgres, redis, milvus — NEVER exposed externally
+    driver: bridge
+    internal: true   # no internet access from this network
+  app_net:        # services that talk to data_net AND app logic
+    driver: bridge
+
+# ── Named volumes (data survives container restarts) ──────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+services:
+
+  # ── PostgreSQL 16 ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: goszakup_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-goszakup}
+      POSTGRES_USER:     ${POSTGRES_USER:-goszakup_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - data_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-goszakup_user} -d ${POSTGRES_DB:-goszakup}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    # ⚠️  NO ports: exposed — only reachable from data_net/app_net
+    # To access locally for debugging: docker exec -it goszakup_postgres psql -U goszakup_user -d goszakup
+
+  # ── Redis (response cache, task queue later) ──────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: goszakup_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD:-redis_change_me}
+    volumes:
+      - redis_data:/data
+    networks:
+      - data_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:-redis_change_me}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # ⚠️  NO ports: exposed
+
+  # ── Adminer (DB UI — development only) ───────────────────────────────────────
+  adminer:
+    image: adminer:4.8.1
+    container_name: goszakup_adminer
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: pepa-linha-dark
+    networks:
+      - data_net
+      - app_net
+    ports:
+      - "127.0.0.1:8080:8080"   # localhost ONLY — not 0.0.0.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - dev    # only starts with: docker compose --profile dev up
+
+  # ── ETL service (Spiral 2) ────────────────────────────────────────────────────
+  # etl:
+  #   build: ./etl
+  #   ...
+
+  # ── Analytics API (Spiral 2) ──────────────────────────────────────────────────
+  # analytics_api:
+  #   build: ./analytics
+  #   ...
+
+  # ── Milvus (Spiral 3) ─────────────────────────────────────────────────────────
+  # milvus:
+  #   image: milvusdb/milvus:v2.4.0
+  #   ...
+
+  # ── AI Agent API (Spiral 3) ───────────────────────────────────────────────────
+  # agent_api:
+  #   build: ./agent
+  #   ...

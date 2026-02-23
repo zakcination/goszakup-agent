@@ -1,0 +1,46 @@
+# ── Secrets (NEVER commit these) ─────────────────────────────────────────────
+.env
+*.env
+secrets/
+.secrets/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ── Data / exports (can be large) ─────────────────────────────────────────────
+data/
+exports/
+*.parquet
+*.csv
+*.json.gz
+
+# ── Docker volumes (local bind mounts) ────────────────────────────────────────
+volumes/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Airflow (generated) ───────────────────────────────────────────────────────
+airflow/logs/
+airflow/plugins/
