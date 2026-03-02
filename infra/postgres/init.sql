@@ -32,6 +32,22 @@ CREATE TABLE IF NOT EXISTS kato_ref (
 );
 COMMENT ON TABLE kato_ref IS 'КАТО — Kazakhstan administrative territories';
 
+CREATE TABLE IF NOT EXISTS trd_buy_kato_metadata (
+    id            SERIAL PRIMARY KEY,
+    trd_buy_id    BIGINT NOT NULL,
+    lot_id        BIGINT REFERENCES lots(id),
+    kato_code     VARCHAR(20),
+    parent_kato   VARCHAR(20),
+    city_ru       TEXT,
+    city_kz       TEXT,
+    source        TEXT DEFAULT 'trd-buy',
+    raw_json      JSONB,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (trd_buy_id, lot_id, kato_code)
+);
+COMMENT ON TABLE trd_buy_kato_metadata IS 'Raw kato metadata extracted from trd-buy payloads';
+
 CREATE TABLE IF NOT EXISTS enstru_ref (
     code        VARCHAR(60) PRIMARY KEY,
     name_ru     TEXT NOT NULL,
@@ -65,6 +81,17 @@ CREATE TABLE IF NOT EXISTS contract_statuses_ref (
     name_kz     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS macro_indices (
+    year             SMALLINT PRIMARY KEY,
+    inflation_pct    NUMERIC(6,3) NOT NULL,
+    gdp_growth_pct   NUMERIC(6,3) NOT NULL,
+    basket_price_kzt NUMERIC(18,2),
+    source           TEXT DEFAULT 'manual',
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ DEFAULT NOW()
+);
+COMMENT ON TABLE macro_indices IS 'National macro indices by year (inflation, GDP growth, basket price)';
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- CORE TABLES
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -90,7 +117,7 @@ CREATE TABLE IF NOT EXISTS subjects (
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
-COMMENT ON TABLE subjects IS 'All organisations: customers (our 27 BINs) + suppliers';
+COMMENT ON TABLE subjects IS 'All organisations: customers (TARGET_BINS) + suppliers';
 CREATE INDEX idx_subjects_is_customer ON subjects(is_customer) WHERE is_customer = TRUE;
 CREATE INDEX idx_subjects_is_rnu ON subjects(is_rnu) WHERE is_rnu = TRUE;
 
@@ -118,7 +145,7 @@ CREATE TABLE IF NOT EXISTS plan_points (
     created_at              TIMESTAMPTZ DEFAULT NOW(),
     synced_at               TIMESTAMPTZ DEFAULT NOW()
 );
-COMMENT ON TABLE plan_points IS 'Annual procurement plans — 3 years × 27 BINs';
+COMMENT ON TABLE plan_points IS 'Annual procurement plans — year range × TARGET_BINS';
 CREATE INDEX idx_plans_customer_year  ON plan_points(customer_bin, fin_year);
 CREATE INDEX idx_plans_enstru         ON plan_points(enstru_code);
 CREATE INDEX idx_plans_amount         ON plan_points(total_amount);
@@ -147,6 +174,7 @@ CREATE INDEX idx_ann_status      ON announcements(status_id);
 CREATE TABLE IF NOT EXISTS lots (
     id              BIGINT PRIMARY KEY,
     announcement_id BIGINT REFERENCES announcements(id),
+    source_trd_buy_id BIGINT,
     customer_bin    VARCHAR(12) REFERENCES subjects(bin),
     enstru_code     VARCHAR(60) REFERENCES enstru_ref(code),
     name_ru         TEXT,
@@ -171,10 +199,19 @@ CREATE INDEX idx_lots_kato      ON lots(kato_delivery);
 CREATE INDEX idx_lots_amount    ON lots(lot_amount);
 CREATE INDEX idx_lots_name_trgm ON lots USING GIN (name_clean gin_trgm_ops);
 
+CREATE TABLE IF NOT EXISTS lot_plan_points (
+    lot_id          BIGINT NOT NULL REFERENCES lots(id),
+    plan_point_id   BIGINT NOT NULL REFERENCES plan_points(id),
+    PRIMARY KEY (lot_id, plan_point_id)
+);
+COMMENT ON TABLE lot_plan_points IS 'Join table: lots ↔ plan_points (point_list)';
+CREATE INDEX idx_lpp_plan_point ON lot_plan_points(plan_point_id);
+
 CREATE TABLE IF NOT EXISTS contracts (
     id                  BIGINT PRIMARY KEY,
     contract_number     VARCHAR(60) UNIQUE,
     announcement_id     BIGINT REFERENCES announcements(id),
+    source_trd_buy_id   BIGINT,
     lot_id              BIGINT REFERENCES lots(id),
     customer_bin        VARCHAR(12) REFERENCES subjects(bin),
     supplier_bin        VARCHAR(12) REFERENCES subjects(bin),
@@ -200,6 +237,7 @@ CREATE INDEX idx_contracts_sum        ON contracts(contract_sum);
 CREATE TABLE IF NOT EXISTS contract_items (
     id              BIGINT PRIMARY KEY,
     contract_id     BIGINT NOT NULL REFERENCES contracts(id),
+    pln_point_id    BIGINT REFERENCES plan_points(id),
     enstru_code     VARCHAR(60) REFERENCES enstru_ref(code),
     name_ru         TEXT,
     name_clean      TEXT,
@@ -212,6 +250,7 @@ CREATE TABLE IF NOT EXISTS contract_items (
 );
 COMMENT ON TABLE contract_items IS 'Line items within contracts — used for Fair Price calc';
 CREATE INDEX idx_citems_contract ON contract_items(contract_id);
+CREATE INDEX idx_citems_plan_point ON contract_items(pln_point_id);
 CREATE INDEX idx_citems_enstru   ON contract_items(enstru_code);
 CREATE INDEX idx_citems_price    ON contract_items(unit_price) WHERE is_price_valid = TRUE;
 
@@ -226,6 +265,78 @@ CREATE TABLE IF NOT EXISTS contract_acts (
     synced_at       TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX idx_acts_contract ON contract_acts(contract_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- RAW LANDING TABLES (incremental high-volume endpoints)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS raw_plans_kato (
+    id                          BIGINT PRIMARY KEY,
+    pln_points_id               BIGINT NOT NULL,
+    ref_kato_code               VARCHAR(20),
+    full_delivery_place_name_ru TEXT,
+    index_date                  TIMESTAMPTZ,
+    payload                     JSONB NOT NULL,
+    synced_at                   TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_raw_plans_kato_point ON raw_plans_kato(pln_points_id);
+CREATE INDEX idx_raw_plans_kato_kato ON raw_plans_kato(ref_kato_code);
+CREATE INDEX idx_raw_plans_kato_index_date ON raw_plans_kato(index_date);
+
+CREATE TABLE IF NOT EXISTS raw_plans_spec (
+    id                  BIGINT PRIMARY KEY,
+    pln_points_id       BIGINT NOT NULL,
+    ekrb_code           VARCHAR(30),
+    fkrb_program_code   VARCHAR(30),
+    amount              NUMERIC(18,4),
+    index_date          TIMESTAMPTZ,
+    payload             JSONB NOT NULL,
+    synced_at           TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_raw_plans_spec_point ON raw_plans_spec(pln_points_id);
+CREATE INDEX idx_raw_plans_spec_ekrb ON raw_plans_spec(ekrb_code);
+CREATE INDEX idx_raw_plans_spec_index_date ON raw_plans_spec(index_date);
+
+CREATE TABLE IF NOT EXISTS raw_acts (
+    id              BIGINT PRIMARY KEY,
+    contract_id     BIGINT,
+    status_id       INTEGER,
+    approve_date    DATE,
+    revoke_date     DATE,
+    index_date      TIMESTAMPTZ,
+    payload         JSONB NOT NULL,
+    synced_at       TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_raw_acts_contract ON raw_acts(contract_id);
+CREATE INDEX idx_raw_acts_status ON raw_acts(status_id);
+CREATE INDEX idx_raw_acts_index_date ON raw_acts(index_date);
+
+CREATE TABLE IF NOT EXISTS raw_treasury_pay (
+    id               BIGINT PRIMARY KEY,
+    contract_id      BIGINT,
+    kato             VARCHAR(20),
+    item_description TEXT,
+    pay_amount       NUMERIC(18,4),
+    pay_date         DATE,
+    index_date       TIMESTAMPTZ,
+    payload          JSONB NOT NULL,
+    synced_at        TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_raw_treasury_contract ON raw_treasury_pay(contract_id);
+CREATE INDEX idx_raw_treasury_kato ON raw_treasury_pay(kato);
+CREATE INDEX idx_raw_treasury_pay_date ON raw_treasury_pay(pay_date);
+CREATE INDEX idx_raw_treasury_index_date ON raw_treasury_pay(index_date);
+
+CREATE TABLE IF NOT EXISTS raw_trd_buy_events (
+    trd_buy_id      BIGINT NOT NULL,
+    event_type      VARCHAR(20) NOT NULL, -- cancel|pause
+    has_event       BOOLEAN NOT NULL DEFAULT FALSE,
+    payload         JSONB NOT NULL,
+    checked_at      TIMESTAMPTZ DEFAULT NOW(),
+    synced_at       TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (trd_buy_id, event_type)
+);
+CREATE INDEX idx_raw_trd_buy_events_type ON raw_trd_buy_events(event_type, checked_at DESC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- OPERATIONAL TABLES (ETL tracking + anomalies)
@@ -251,6 +362,35 @@ COMMENT ON TABLE etl_runs IS 'ETL audit log — every run recorded here';
 CREATE INDEX idx_etl_entity  ON etl_runs(entity, run_ts DESC);
 CREATE INDEX idx_etl_status  ON etl_runs(status) WHERE status != 'ok';
 
+CREATE TABLE IF NOT EXISTS etl_state (
+    entity       VARCHAR(40) NOT NULL,
+    customer_bin VARCHAR(12),
+    last_id      BIGINT,
+    resume_path  TEXT,
+    updated_at   TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (entity, customer_bin)
+);
+COMMENT ON TABLE etl_state IS 'Checkpoint state for resume-by-BIN ingestion';
+
+CREATE TABLE IF NOT EXISTS journal_entries (
+    id          BIGSERIAL PRIMARY KEY,
+    entity      VARCHAR(40),
+    object_id   BIGINT,
+    customer_bin VARCHAR(12),
+    payload     JSONB,
+    occurred_at TIMESTAMPTZ,
+    ingested_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_journal_entity_time ON journal_entries(entity, occurred_at);
+CREATE INDEX idx_journal_customer ON journal_entries(customer_bin);
+
+CREATE TABLE IF NOT EXISTS analytics_export_state (
+    table_name      VARCHAR(60) PRIMARY KEY,
+    last_exported_at TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+COMMENT ON TABLE analytics_export_state IS 'Tracks incremental Parquet exports';
+
 CREATE TABLE IF NOT EXISTS anomaly_flags (
     id              SERIAL PRIMARY KEY,
     detected_at     TIMESTAMPTZ DEFAULT NOW(),
@@ -273,6 +413,16 @@ CREATE INDEX idx_anomaly_entity   ON anomaly_flags(entity_type, entity_id);
 CREATE INDEX idx_anomaly_customer ON anomaly_flags(customer_bin);
 CREATE INDEX idx_anomaly_type     ON anomaly_flags(anomaly_type);
 CREATE INDEX idx_anomaly_reviewed ON anomaly_flags(is_reviewed) WHERE NOT is_reviewed;
+
+CREATE TABLE IF NOT EXISTS quality_snapshots (
+    id            BIGSERIAL PRIMARY KEY,
+    run_id        VARCHAR(80) NOT NULL,
+    metric_name   VARCHAR(120) NOT NULL,
+    metric_value  NUMERIC(20,6) NOT NULL,
+    captured_at   TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_quality_run ON quality_snapshots(run_id);
+CREATE INDEX idx_quality_metric ON quality_snapshots(metric_name, captured_at DESC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- HELPER VIEWS
@@ -308,39 +458,7 @@ WHERE s.is_customer = TRUE
 GROUP BY s.bin, s.name_ru
 ORDER BY total_contracted DESC NULLS LAST;
 
--- ─────────────────────────────────────────────────────────────────────────────
--- SEED: target BINs as customers (known from ТЗ)
--- ─────────────────────────────────────────────────────────────────────────────
-INSERT INTO subjects (bin, name_ru, is_customer, last_synced_at)
-VALUES
-    ('000740001307', 'Организация 000740001307', TRUE, NULL),
-    ('020240002363', 'Организация 020240002363', TRUE, NULL),
-    ('020440003656', 'Организация 020440003656', TRUE, NULL),
-    ('030440003698', 'Организация 030440003698', TRUE, NULL),
-    ('050740004819', 'Организация 050740004819', TRUE, NULL),
-    ('051040005150', 'Организация 051040005150', TRUE, NULL),
-    ('100140011059', 'Организация 100140011059', TRUE, NULL),
-    ('120940001946', 'Организация 120940001946', TRUE, NULL),
-    ('140340016539', 'Организация 140340016539', TRUE, NULL),
-    ('150540000186', 'Организация 150540000186', TRUE, NULL),
-    ('171041003124', 'Организация 171041003124', TRUE, NULL),
-    ('210240019348', 'Организация 210240019348', TRUE, NULL),
-    ('210240033968', 'Организация 210240033968', TRUE, NULL),
-    ('210941010761', 'Организация 210941010761', TRUE, NULL),
-    ('230740013340', 'Организация 230740013340', TRUE, NULL),
-    ('231040023028', 'Организация 231040023028', TRUE, NULL),
-    ('780140000023', 'Организация 780140000023', TRUE, NULL),
-    ('900640000128', 'Организация 900640000128', TRUE, NULL),
-    ('940740000911', 'Организация 940740000911', TRUE, NULL),
-    ('940940000384', 'Организация 940940000384', TRUE, NULL),
-    ('960440000220', 'Организация 960440000220', TRUE, NULL),
-    ('970940001378', 'Организация 970940001378', TRUE, NULL),
-    ('971040001050', 'Организация 971040001050', TRUE, NULL),
-    ('980440001034', 'Организация 980440001034', TRUE, NULL),
-    ('981140001551', 'Организация 981140001551', TRUE, NULL),
-    ('990340005977', 'Организация 990340005977', TRUE, NULL),
-    ('990740002243', 'Организация 990740002243', TRUE, NULL)
-ON CONFLICT (bin) DO NOTHING;
-
-SELECT 'Schema created. Subjects seeded: ' || COUNT(*) || ' rows' AS status
-FROM subjects WHERE is_customer = TRUE;
+-- NOTE:
+-- Target BINs are configured via TARGET_BINS in .env and populated by ETL:
+--   python etl/load_subjects.py
+SELECT 'Schema created.' AS status;

@@ -46,14 +46,17 @@ services:
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     networks:
       - data_net
+      - app_net
+    ports:
+      - "127.0.0.1:5432:5432"   # localhost ONLY — for host-run ETL/scripts
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-goszakup_user} -d ${POSTGRES_DB:-goszakup}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 20s
-    # ⚠️  NO ports: exposed — only reachable from data_net/app_net
-    # To access locally for debugging: docker exec -it goszakup_postgres psql -U goszakup_user -d goszakup
+    # To access locally for debugging:
+    #   psql "postgresql://goszakup_user:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB:-goszakup}"
 
   # ── Redis (response cache, task queue later) ──────────────────────────────────
   redis:
@@ -69,12 +72,14 @@ services:
       - redis_data:/data
     networks:
       - data_net
+      - app_net
+    ports:
+      - "127.0.0.1:6379:6379"   # localhost ONLY — for host-run ETL/scripts
     healthcheck:
       test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:-redis_change_me}", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
-    # ⚠️  NO ports: exposed
 
   # ── Adminer (DB UI — development only) ───────────────────────────────────────
   adminer:
@@ -101,9 +106,25 @@ services:
   #   ...
 
   # ── Analytics API (Spiral 2) ──────────────────────────────────────────────────
-  # analytics_api:
-  #   build: ./analytics
-  #   ...
+  analytics_api:
+    build:
+      context: .
+      dockerfile: services/analytics_api/Dockerfile
+    container_name: goszakup_analytics_api
+    restart: unless-stopped
+    environment:
+      ANALYTICS_DB_PATH: /app/data/analytics.duckdb
+      ANALYTICS_PARQUET_DIR: /app/data/parquet
+    volumes:
+      - ./:/app
+    networks:
+      - data_net
+      - app_net
+    ports:
+      - "127.0.0.1:8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # ── Milvus (Spiral 3) ─────────────────────────────────────────────────────────
   # milvus:
@@ -111,6 +132,41 @@ services:
   #   ...
 
   # ── AI Agent API (Spiral 3) ───────────────────────────────────────────────────
-  # agent_api:
-  #   build: ./agent
-  #   ...
+  agent_api:
+    build:
+      context: .
+      dockerfile: services/agent_api/Dockerfile
+    container_name: goszakup_agent_api
+    restart: unless-stopped
+    environment:
+      ANALYTICS_DB_PATH: /app/data/analytics.duckdb
+    volumes:
+      - ./:/app
+    networks:
+      - data_net
+      - app_net
+    ports:
+      - "127.0.0.1:8002:8002"
+    depends_on:
+      analytics_api:
+        condition: service_started
+
+  # ── Demo UI (Spiral 4) ───────────────────────────────────────────────────────
+  ui:
+    build:
+      context: .
+      dockerfile: services/ui/Dockerfile
+    container_name: goszakup_ui
+    restart: unless-stopped
+    environment:
+      AGENT_API_URL: http://agent_api:8002
+      ANALYTICS_API_URL: http://analytics_api:8001
+    volumes:
+      - ./:/app
+    networks:
+      - app_net
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      agent_api:
+        condition: service_started

@@ -1,0 +1,17 @@
+lots_total                                    97920
+lots_with_announcement                         3004 / 97920      (  3.07%)
+lots_with_source_trd_buy_id                       0 / 97920      (  0.00%)
+lots_with_enstru                                937 / 97920      (  0.96%)
+lots_with_unit                                  937 / 97920      (  0.96%)
+lots_with_kato                                    0 / 97920      (  0.00%)
+contracts_total                               11649
+contracts_with_announcement                     187 / 11649      (  1.61%)
+contracts_with_source_trd_buy_id                  0 / 11649      (  0.00%)
+contract_items_total                            487
+contract_items_with_pln_point_id                  0 / 487        (  0.00%)
+contract_items_with_enstru_code                 486 / 487        ( 99.79%)
+contract_items_with_unit_code                   486 / 487        ( 99.79%)
+plan_points_total                             31670
+plan_points_with_kato                           866 / 31670      (  2.73%)
+kato_ref_rows                                 16764
+lot_plan_points_rows                            942

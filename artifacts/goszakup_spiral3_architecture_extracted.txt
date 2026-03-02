@@ -1,0 +1,367 @@
+goszakup-agent
+Analytics Pipeline & Agentic Workflow
+Architecture Design Document — Spiral 3
+March 2026  ·  Based on DB Snapshot 2026-03-01
+1. Situation Report — What the Data Actually Says
+The snapshot taken 2026-03-01 shows 218,804 rows across 25 tables. The pipeline runs. The data is present. However, several structural issues must be resolved before analytics can produce reliable, non-misleading outputs.
+1.1 Data Volume — What's There
+Table
+Rows / Size
+lots
+97,920 rows · 59.6 MB
+announcements
+36,317 rows · 11.4 MB
+plan_points
+31,670 rows · 12.7 MB
+contracts
+11,674 rows · 4.1 MB
+subjects
+7,885 rows (27 customers + 7,858 suppliers)
+contract_items
+713 rows — CRITICAL UNDER-REPRESENTATION
+lot_plan_points
+942 linkage rows
+raw_acts
+749 rows
+1.2 Critical Data Quality Problems
+⚠
+P0 — BLOCKING: enstru_code is NULL on 96,903 of 97,920 lots (99%). Without КТРУ codes, Fair Price Engine cannot group by goods category. Every price comparison will be meaningless.
+⚠
+P0 — BLOCKING: contract_items has only 713 rows for 11,674 contracts. That is 6% coverage. unit_price in contract_items is the primary input to Fair Price calculation. With 94% missing, median prices will be computed on biased samples.
+⚠
+P0 — BLOCKING: contracts.lot_id is NULL on 100% of rows (11,674). contracts.trade_method_id is NULL on 100%. This means the Plan→Lot→Contract audit trail is broken at the last link.
+⚠
+P1 — DEGRADED: lots.kato_delivery is NULL on 81.2% (79,514 rows). Regional price comparison (K_region) requires delivery location. Without it, all prices are pooled nationally regardless of geography.
+⚠
+P1 — DEGRADED: enstru_ref has 9,009 entries but ALL section/division/group_code columns are NULL. Hierarchical fallback (national if N<20 at city level) cannot work without section-level grouping.
+1.3 Root Causes
+These are ETL mapping gaps, not API limitations. The OWS v3 API provides all the missing fields:
+Missing Field
+OWS Source
+lots.enstru_code
+API field ref_enstru_code — present in GET /v3/lots/bin/{bin} response
+lots.unit_code
+API field ref_units_code — present in lots response
+lots.kato_delivery
+API array deliveryPlaces[0].refKatoCode — requires array extraction
+contract_items low
+ETL loads items per contract via GET /v3/contract/{id}/units — appears to be running but only for a subset of contracts. Must run for all 11,674.
+contracts.lot_id
+API field lot_id — present in contract response, just not mapped
+enstru_ref sections
+КТРУ code structure: first 2 chars = section, chars 3-4 = division. Derivable from the code itself, no API call needed.
+2. Pre-Flight Fixes Before Analytics Can Start
+These are not Spiral 3 features — they are correctness prerequisites. Analytics built on the current data will produce wrong numbers that erode trust. Fix first, then build.
+2.1 Fix ETL — Backfill Missing Fields (1–2 days)
+F1
+Fix load_lots.py
+Map ref_enstru_code → enstru_code; ref_units_code → unit_code; deliveryPlaces[0] → kato_delivery. Re-run load_lots for all 27 BINs. Expected: 97,920 rows updated.
+F2
+Fix load_contracts.py
+Map lot_id, trade_method_id from contract response. Both fields exist in API output but were not included in the INSERT. Re-run load_contracts.
+F3
+Complete contract_items
+Run GET /v3/contract/{id}/units for all 11,674 contracts. Current 713 rows suggest the loader stopped early or only ran for a subset. Expected: 10,000–50,000 items.
+F4
+Fix enstru_ref sections
+Derive section/division/group_code from the КТРУ code string itself. A one-time SQL UPDATE: section = SUBSTRING(code, 1, 2) where section IS NULL.
+F5
+Verify results
+Run verify_spiral2.py. Confirm: lots.enstru_code coverage > 50%, contract_items > 8,000, contracts.lot_id coverage > 80%.
+3. Analytics Pipeline Architecture
+Once data is reliable, the analytics pipeline computes three layers of derived knowledge: Fair Price benchmarks, anomaly scores, and conversation context for the AI agent.
+3.1 Layer Architecture
+Layer
+Tool
+What It Computes
+Output
+L1
+PostgreSQL
+Normalize + deduplicate. Provenance per record.
+Clean tables + raw_provenance
+L2
+DuckDB (in-process)
+Aggregations: median price per КТРУ + region + quarter. IQR, MAD, Isolation Forest scores.
+Parquet files + market_price_stats
+L3
+PostgreSQL
+Write computed stats back. Populate anomaly_flags. Update quality_snapshots.
+anomaly_flags, market_price_stats
+L4
+Redis
+Cache pre-computed answers. TTL = 1h for summaries, 5m for live queries.
+Cached JSON responses
+L5
+FastAPI
+Parameterized SQL tools. Structured JSON output. No free-form SQL.
+REST API for agent
+L6
+LLM (nitec-ai.kz)
+Verbalize computed results. Never touch raw data directly.
+Natural language + drill-down
+3.2 Fair Price Engine
+The Fair Price calculation requires a reference pool of comparable prices. Given the data structure, the recommended approach is:
+Reference Pool Strategy
+Dimension
+Implementation
+Grouping key
+enstru_code (КТРУ) + unit_norm + region_id (KATO level-2) + fin_year
+Price source
+contract_items.unit_price WHERE is_price_valid = TRUE — this is the ground truth
+Fallback hierarchy
+City (N≥20) → Oblast (N≥20) → National (N≥20) → Insufficient data verdict
+Statistics
+Median + IQR. MAD when N < 10. Winsorize at p5/p95 before computing
+Time adjustment
+K_time = CPI(target_quarter) / CPI(baseline_quarter). Use macro_indices table (currently 3 placeholder rows — needs real Kazakhstan CPI data)
+K_vol
+1.0 for MVP — disabled pending volume-discount data accumulation
+K_region
+Derived from ratio of regional median to national median, not hand-tuned constants
+Fair Price Formula (operational)
+FairPrice(enstru, kato, quarter) =
+  Median( unit_price WHERE enstru=enstru AND region=region AND quarter=quarter )
+  × K_region   (regional_median / national_median)
+  × K_time     (CPI[target] / CPI[baseline])
+  × K_vol      (= 1.0, MVP placeholder)
+Deviation% = (P_actual − FairPrice) / FairPrice × 100%
+IF N < 20 at any fallback level → verdict = INSUFFICIENT_DATA
+3.3 Anomaly Detection Pipeline
+Method
+Condition
+Generates Flag
+Confidence
+Rule-based
+Deviation > +50% above FairPrice
+price_high
+HIGH
+Rule-based
+Deviation < −40% below FairPrice
+price_low
+HIGH
+IQR (N≥10)
+unit_price outside [Q1−1.5×IQR, Q3+1.5×IQR]
+statistical_outlier
+MEDIUM
+MAD (N<10)
+unit_price deviates > 3.5 MAD
+statistical_outlier
+LOW
+Isolation Forest (N≥50)
+anomaly_score > 0.65
+pattern_anomaly
+MEDIUM
+YoY
+price increase > 40% vs same КТРУ prior year
+yoy_spike
+MEDIUM
+Single-supplier
+supplier appears in > 70% of contracts for a КТРУ
+concentration_risk
+HIGH
+4. Agentic Workflow Design
+The agent translates natural language questions into structured tool calls, executes them against pre-computed analytics, and verbalizes the results. The LLM never sees raw data, never generates SQL, and never invents numbers.
+4.1 Request Flow (Every Query)
+1
+Parse Intent
+LLM classifies query into one of 8 intent types (see §4.2). Extracts structured parameters: {org, enstru, period, top_k, threshold}. Fails fast if intent is unclear.
+2
+Build Tool Call
+Intent → allowed tool from the whitelist. Parameters are validated against schema. No free-form SQL. No parameter injection possible.
+3
+Check Cache
+Redis lookup by (tool_name, params_hash). HIT: return cached JSON immediately. MISS: proceed to execution.
+4
+Execute Tool
+FastAPI calls parameterized PostgreSQL or DuckDB query. Returns structured JSON with numbers, IDs, and evidence links. No text generation here.
+5
+Enrich Context
+Attach: N (sample size), method used, data freshness timestamp, top-K comparable contract IDs with portal links.
+6
+Verbalize
+LLM receives structured JSON + narration template. Writes the answer in Russian/Kazakh. Inserts numbers programmatically. Cannot change the computed values.
+7
+Drill-Down Ready
+Response includes follow-up tool references. User can ask 'detail on contract X' and the next query has pre-populated context.
+4.2 Intent Classification — 8 Types
+Intent
+Example Query (RU)
+Tool Called
+PRICE_CHECK
+«Сколько стоит ноутбук по рынку?»
+get_fair_price(enstru, kato, period)
+ORG_SUMMARY
+«Сводка закупок по 210240019348»
+get_org_summary(bin, period)
+ANOMALY_SCAN
+«Подозрительные закупки за 2024»
+get_anomalies(customer_bin, period, min_confidence)
+SUPPLIER_CHECK
+«Кто поставляет топливо нашим организациям?»
+get_supplier_profile(enstru, customer_bins)
+AUDIT_TRAIL
+«История договора №ДГ-2024-1234»
+get_audit_trail(contract_number)
+PLAN_VS_FACT
+«Выполнение плана по больнице за 2025»
+get_plan_execution(customer_bin, fin_year)
+TOP_K
+«Топ-10 дорогих лотов в 2024»
+get_top_k(dimension, period, k, filters)
+COVERAGE_GAPS
+«Что в плане, но нет договора?»
+get_uncontracted_plans(customer_bin, fin_year)
+4.3 Tool Whitelist (No Free-Form SQL)
+Each tool is a Python function with a fixed SQL template and validated input schema. The LLM can only call tools from this list with validated parameters. This eliminates SQL injection and hallucinated queries.
+Tool Name
+Parameters
+Returns
+get_fair_price()
+enstru_code, region_id, period_from, period_to
+FairPrice, N, method, comparables[]
+get_org_summary()
+customer_bin, fin_year
+total_planned, total_contracted, execution_rate, top_5_enstru
+get_anomalies()
+customer_bin, period, confidence_min, limit
+anomaly_flags[], deviation%, method
+get_supplier_profile()
+enstru_code, customer_bins[]
+supplier_stats[], concentration_score, rnu_flag
+get_audit_trail()
+contract_id OR contract_number
+plan→announcement→lot→contract→acts chain
+get_plan_execution()
+customer_bin, fin_year
+planned_sum, contracted_sum, gap, by_enstru_breakdown
+get_top_k()
+dimension, period, k, filters{}
+ranked list with amounts, links
+get_uncontracted_plans()
+customer_bin, fin_year
+plan_points with no matching contract
+4.4 Drill-Down Response Structure (L0→L4)
+Every agent response is structured in layers. The user sees L0 immediately. Subsequent layers are available on demand without a new query — context is pre-populated.
+Level
+Name
+Content
+L0
+VERDICT
+One sentence + numbers. Example: «Рыночная цена ноутбука HP ProBook: 285,000 ₸ (медиана по 34 договорам, Алматы, 2024). Ваша закупка: 420,000 ₸ — превышение +47%.»
+L1
+BREAKDOWN
+Top-5 organisations by amount. For each: contracted sum, deviation from FairPrice, contract count.
+L2
+ANALYTICS
+Full stats: median, IQR, N, method used, data coverage, time period, regional scope. Fair Price components shown.
+L3
+EXAMPLES
+Top-3 comparable contracts with ID, supplier, amount, date, portal link. Top-3 most anomalous with deviation%.
+L4
+AUDIT TRAIL
+Complete provenance: Plan ID → Announcement number → Lot ID → Contract number → Act IDs. Every ID links to portal.
+META
+CONFIDENCE
+HIGH / MEDIUM / LOW with reason. Shows: N used, data freshness, any caveats (e.g. 'KATO missing on 81% of lots').
+4.5 Insufficient Data Handling
+This is a first-class outcome, not an error. When N < 20 at all fallback levels, the agent returns a structured verdict rather than a guessed number.
+VERDICT: INSUFFICIENT_DATA
+Причина: В базе найдено только 3 договора по КТРУ 26.20.11 в Нур-Султане за 2024.
+Что есть: N=3, min=180,000 ₸, max=340,000 ₸ — слишком мало для статистически надёжной оценки.
+Рекомендация: Расширьте диапазон до 2023–2024 (N=11) или до всей страны (N=47).
+Действие: /expand_scope enstru=26.20.11 period=2023-2024
+5. Security & Data Minimisation
+Specific to the agentic layer — what the LLM is and is not allowed to see:
+What LLM Receives
+What LLM Never Receives
+Aggregated statistics (median, count, IQR)
+Raw procurement text dumps
+Contract IDs and portal links
+Full subject profiles with emails/phones
+Deviation percentages and flags
+Token, API keys, internal DB credentials
+Top-K comparable IDs (not full records)
+Bulk data exports or unfiltered tables
+Structured JSON from tool whitelist only
+Direct database access or SQL generation
+ℹ
+Data Minimization: The LLM prompt contains only: (a) the structured tool output JSON, (b) the narration template specifying response format, and (c) the user query. No bulk data, no internal IDs beyond what is needed, no credentials.
+6. Implementation Plan — Spiral 3
+Week 1: Fix Data, Build Analytics Layer
+S3.1
+ETL Fixes (F1–F5)
+Fix lot ETL fields, complete contract_items, derive enstru sections. Re-run loaders. Verify with verify_spiral2.py. Block: do not proceed until contract_items > 8,000 rows.
+S3.2
+CPI Data
+Load real Kazakhstan CPI quarterly data into macro_indices (currently 3 placeholder rows). Source: stat.gov.kz. Required for K_time calculation.
+S3.3
+DuckDB analytics/fair_price.py
+Implement compute_fair_price(enstru, region, period). Returns: {fair_price, N, method, scope_level} or InsufficientDataError. Unit-testable without DB.
+S3.4
+analytics/anomaly.py
+Implement all 6 anomaly methods. Write flags to anomaly_flags table. Include sample_n and deviation_pct on every flag.
+S3.5
+Airflow DAG: spiral3_refresh
+Daily job: export Parquet from PostgreSQL → run DuckDB analytics → write back market_price_stats + anomaly_flags → invalidate Redis cache.
+Week 2: API Layer + Agent Integration
+S3.6
+agent/tools.py
+Implement all 8 tool functions as Python functions with Pydantic input/output schemas. Each tool returns a ToolResult with verdict, data{}, evidence{}, confidence.
+S3.7
+agent/intent.py
+Intent classifier: LLM call with structured output schema. Maps query → (IntentType, parameters). Fallback: ask clarification if confidence < 0.7.
+S3.8
+agent/agent.py
+Main loop: parse intent → validate params → cache check → execute tool → format response → L0 output + available drill-downs.
+S3.9
+FastAPI app.py
+POST /query endpoint. Rate-limited. Auth via header. Returns structured response. Swagger docs auto-generated from Pydantic schemas.
+S3.10
+Integration tests
+10 canonical queries with expected outputs. Run against real DB. Assert: numbers match direct SQL, no hallucinated values, confidence correctly reported.
+6.1 File Structure After Spiral 3
+goszakup-agent/
+├── analytics/
+│   ├── fair_price.py    ← compute_fair_price() + InsufficientDataError
+│   ├── anomaly.py      ← 6 detection methods → anomaly_flags
+│   └── refresh.py     ← DuckDB pipeline + Airflow DAG entry
+├── agent/
+│   ├── intent.py       ← classify query → IntentType + params
+│   ├── tools.py        ← 8 tool functions, Pydantic schemas, no raw SQL
+│   ├── agent.py        ← main loop: intent→tool→cache→verbalize
+│   └── templates.py    ← RU/KZ narration templates per intent
+├── api/
+│   └── app.py          ← FastAPI: POST /query, GET /health
+├── tests/
+│   └── test_canonical.py ← 10 canonical queries, assert no hallucination
+└── etl/                ← (existing, patched)
+7. Acceptance Criteria
+These are the verifiable checks that define 'working':
+#
+Criterion
+How to Verify
+1
+contract_items > 8,000 rows with is_price_valid = TRUE
+SELECT COUNT(*) FROM contract_items WHERE is_price_valid
+2
+lots.enstru_code non-null > 50%
+SELECT COUNT(*) FROM lots WHERE enstru_code IS NOT NULL
+3
+Fair Price returns a number (not INSUFFICIENT_DATA) for at least 20 distinct КТРУ codes
+python analytics/fair_price.py --check-coverage
+4
+anomaly_flags table has > 0 rows after refresh
+SELECT COUNT(*) FROM anomaly_flags
+5
+Agent returns L0 verdict in ≤ 3 seconds for cached query
+pytest tests/test_canonical.py::test_response_time
+6
+Numbers in agent response match direct SQL on same data
+pytest tests/test_canonical.py::test_no_hallucination
+7
+INSUFFICIENT_DATA returned when N < 20 at all levels
+pytest tests/test_canonical.py::test_insufficient_data
+8
+Audit trail L4 produces a valid plan→contract chain for ≥ 80% of contracts
+SELECT COUNT(*) FROM v_audit_trail WHERE plan_id IS NOT NULL
+goszakup-agent · Spiral 3 Architecture · March 2026

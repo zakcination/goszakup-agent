@@ -1,0 +1,909 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body{font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; line-height:1.45; font-size:12pt; color:#111;}
+h1{font-size:22pt; margin:0 0 12px 0;}
+h2{font-size:16pt; margin:18px 0 8px 0;}
+h3{font-size:13pt; margin:14px 0 6px 0;}
+code, pre{font-family: Menlo, Consolas, monospace; font-size:10pt;}
+pre{background:#f5f7fa; padding:8px; border:1px solid #dbe2ea;}
+table{border-collapse:collapse; width:100%; margin:8px 0;}
+th, td{border:1px solid #c8d1dc; padding:6px; vertical-align:top;}
+th{background:#eef2f7;}
+hr{border:none; border-top:1px solid #d0d7de; margin:14px 0;}
+</style></head><body><h1 id="ai">AI‑агент анализа государственных закупок Республики Казахстан</h1>
+<h2 id="_1">Технический отчет (история реализации + архитектура + результаты + демо‑презентация)</h2>
+<p>Дата: 2026‑03‑02<br>
+Проект: <code>goszakup-agent</code><br>
+Источник данных: OWS v3 (<code>https://goszakup.gov.kz/ru/developer/ows_v3</code>)<br>
+Период: 2024–2026<br>
+Охват: 27 организаций (BIN из ТЗ)<br>
+Исполнитель: один исполнитель (индивидуальная реализация)</p>
+<hr>
+<h2 id="0">0) Контекст и требования ТЗ (что именно нужно было сделать)</h2>
+<p>ТЗ задает не «чатбот», а аналитическую систему государственного уровня, где критичны:
+- проверяемость (любая цифра должна быть воспроизводима и иметь доказательства);
+- объяснимость (почему пришли к выводу, на каких данных, размер выборки N, метод);
+- надежная загрузка данных (ETL, нормализация, контроль качества);
+- поддержка инкрементального обновления (до 24 часов задержки);
+- безопасность (защита токенов API, on‑prem развёртывание, минимизация утечек);
+- обязательные сценарии:
+  - аномалии цен (<code>&gt;30%</code> от референса по ЕНСТРУ);
+  - справедливость цены по лоту <code>лот №...</code> (сравнение с аналогами и той же локацией);
+  - объемы (нетипичное завышение количества год‑к‑году).</p>
+<p>Допускается RAG/fine‑tuning, но с ключевым ограничением: LLM не должна «считать» и не должна «придумывать» факты; расчёты выполняются внешними инструментами (SQL/Python), а LLM работает в рамках контроля и форматирования.</p>
+<p><strong>Итоговый подход проекта</strong>: построить data‑first pipeline, где LLM ограничена и не имеет доступа к сырым выгрузкам или SQL.</p>
+<hr>
+<h2 id="1">1) Запуск проекта: базовая стратегия и обоснование решений</h2>
+<h3 id="11-spiral-15">1.1 Почему спиральная разработка (Spiral 1–5)</h3>
+<p>Реальные госданные сложны по структуре и качеству. Любая аналитика без устойчивого ingestion и lineage быстро приводит к визуализациям и выводам на неполных либо некорректных данных. В рамках реализации выбран спиральный подход:</p>
+<ul>
+<li><strong>Spiral 1</strong>: инфраструктура + схема БД + проверка связности.</li>
+<li><strong>Spiral 2</strong>: ingestion «ядра» сущностей + целостность (FK) + lineage.</li>
+<li><strong>Spiral 3</strong>: quality‑first redesign, инкрементальные воркеры для high‑volume endpoint’ов.</li>
+<li><strong>Spiral 4</strong>: аналитические витрины (DuckDB marts) и API для аналитики.</li>
+<li><strong>Spiral 5</strong>: строгий agentic слой (intent → whitelist tools → cache → explainable ответ) + submission UI.</li>
+</ul>
+<p>Каждая спираль завершалась проверяемыми gate‑проверками (<code>verify_spiral2.py</code>, <code>verify_spiral3.py</code>, quality snapshots). Это ключевой инженерный принцип в аналитике.</p>
+<h3 id="12">1.2 Базовые технологические решения</h3>
+<ul>
+<li>Язык: <strong>Python</strong> (async + httpx + pydantic).</li>
+<li>Хранилище истины: <strong>PostgreSQL 16</strong> (нормализованная схема + FKs).</li>
+<li>Кэш: <strong>Redis</strong> (используется как инфраструктурный слой; в агентном слое есть Redis/in‑memory cache).</li>
+<li>OLAP/витрины: <strong>DuckDB</strong> + Parquet.</li>
+<li>API: <strong>FastAPI</strong> (analytics API и agent API).</li>
+<li>Демо интерфейс: <strong>Streamlit</strong>.</li>
+<li>Деплой: <strong>Docker Compose</strong> (on‑prem friendly). Сетевые зоны и порты ограничены <code>127.0.0.1</code>.</li>
+</ul>
+<p>Почему не ClickHouse/Milvus сразу:
+- MVP должен быть воспроизводимым и защищенным.
+- ClickHouse и Milvus дают пользу позже, когда ingestion и качество витрин стабилизированы.
+- Инфраструктура намеренно упрощена в целях скорости внедрения и повышения надежности; данное решение закреплено в документации.</p>
+<h3 id="13-ows-v3">1.3 Анализ документации OWS v3 и выбор данных (практический аспект)</h3>
+<p>Документация OWS v3 на практике задает не только список endpoint’ов, но и практические ограничения:
+- какие сущности существуют и какие поля в них стабильны;
+- где есть прямые ссылки между сущностями, а где их нет и придется строить lineage через промежуточные связи;
+- какие endpoint’ы high‑volume и требуют инкрементальности/чекпоинтов;
+- где возможны 500/429 и как строить retriable‑паттерны.</p>
+<p>В проекте применен подход «сначала модель данных и audit trail, затем аналитика». Это означало:
+- выбирать endpoint’ы, которые дают <strong>идентификаторы</strong> (ID, BIN, ENSTRU, KATO) и позволяют построить связи;
+- хранить эти идентификаторы в БД в явном виде и обеспечивать FK‑целостность;
+- добавлять enrichment endpoint’ы (например, <code>/v3/plans/kato</code>) только после того, как ядро ingestion стало воспроизводимым.</p>
+<p><strong>Минимум сущностей по ТЗ</strong> (и что они означают в OWS):
+- <code>subject</code> (заказчик/поставщик): организация, идентифицируется BIN/BIIN, используется в планах и договорах.
+- <code>plans</code>: плановые позиции (plan points) закупок заказчика, «что хотели купить» (объем/сумма/ЕНСТРУ/ед.изм., и иногда место поставки).
+- <code>trd-buy</code>: объявление о закупке (procurement/announcement), «как закупка была объявлена на портале».
+- <code>lots</code>: лоты внутри объявления, «что реально выставили на торги».
+- <code>contracts</code>: договоры, «что реально заключили».
+- <code>contract units/items</code>: позиции договора (цена/кол-во/сумма), «что реально купили и по какой цене».</p>
+<p><strong>Ключевой практический вывод по связям</strong>: часть связей в API не является «идеальной цепочкой» (не всегда есть прямые поля <code>contract -&gt; lot</code>). С начала разработки реализована стратегия lineage:
+- сохранять <code>announcement_id</code> / <code>source_trd_buy_id</code> где доступно;
+- сохранять связь <code>lot -&gt; plan_point</code> через <code>point_list</code> (и таблицу <code>lot_plan_points</code>);
+- сохранять связь <code>contract_item -&gt; plan_point</code> через <code>pln_point_id</code>;
+- строить audit trail как «самую полную доступную цепочку» (а не как одну идеальную ссылку).</p>
+<h3 id="14">1.4 Хронология реализации (как это выглядело в реальном инженерном цикле)</h3>
+<p>В этом разделе приведены реальные этапы, выявленные сложности и принятые инженерные решения, за счет которых прототип последовательно доводился до системы, пригодной для демонстрации и защиты.</p>
+<p><strong>Spiral 1: запуск окружения и проверка связности</strong>
+- Работа началась с <code>./setup.sh</code> и <code>scripts/check_connections.py</code>, чтобы подтвердить готовность окружения: работоспособность Docker, доступность портов, запуск Postgres/Redis, корректность переменных окружения (включая токен OWS).
+- На данном этапе был выявлен типовой класс проблем: запуск скриптов на хосте в отличающемся интерпретаторе/venv относительно окружения, где установлены зависимости. Симптомы: <code>asyncpg not installed</code>, <code>redis not installed</code>.
+- Принято решение закрепить зависимости в <code>requirements.txt</code> и сделать <code>setup.sh</code>/README максимально детерминированными. В результате <code>scripts/check_connections.py</code> стал обязательным gate‑скриптом перед ingestion.</p>
+<p><strong>Spiral 2: ingestion ядра сущностей и закрытие критических gaps</strong>
+- На уровне первичной загрузки лотов и договоров были выявлены проблемы, которые блокируют реализацию обязательных аналитических сценариев:
+  - отсутствует таблица для связи plan→lot (<code>point_list</code> из API некуда записывать);
+  - FK‑падения на незнакомых ENSTRU и поставщиках (supplier BIN);
+  - повторные запросы <code>trd-buy/{id}</code> тысячами (замедление и рост ошибок).
+- Для устранения данных рисков была переработана базовая логика ingestion:
+  - добавили <code>lot_plan_points</code> и начали сохранять весь <code>point_list</code>;
+  - добавили <code>ensure_enstru_ref</code> и <code>ensure_subject</code> и сделали ETL FK‑safe;
+  - добавили in‑flight dedupe/кеш в клиенте, чтобы убрать дублирующиеся запросы.</p>
+<p><strong>Spiral 3: аналитика и столкновение с «реальностью окружения»</strong>
+- При переходе к <code>pandas/duckdb/pyarrow</code> для Parquet‑экспорта было установлено, что на новых версиях Python возможны сложности установки (например, сборка <code>pyarrow</code> из исходников).
+- В целях воспроизводимости analytics‑слой и agent‑слой вынесены в контейнеры со стабильным runtime и wheel‑совместимостью.
+- Одновременно было подтверждено наличие существенных пропусков в региональных атрибутах и ENSTRU‑полях. В ответах такие пропуски не маскируются: они отражаются через <code>confidence/limitations</code>, а также через вердикт <code>insufficient_data</code> как штатный исход.</p>
+<hr>
+<h2 id="2-api-storage-trust-boundaries">2) Архитектура (API → storage) и trust boundaries</h2>
+<h3 id="21">2.1 Общая схема</h3>
+<pre><code class="language-text">OWS v3 API
+  -&gt; ETL (async, checkpointed, idempotent)
+  -&gt; PostgreSQL (source of truth, FK, lineage)
+  -&gt; Parquet export
+  -&gt; DuckDB marts (analytics layer)
+  -&gt; Analytics API
+  -&gt; Agent API (strict tools)
+  -&gt; UI (Streamlit)
+</code></pre>
+<h3 id="22-trust-boundaries">2.2 Trust boundaries (безопасность и минимизация данных)</h3>
+<p>Зоны доверия разделены таким образом, чтобы LLM не могла:
+- получить токены/пароли/строки подключения;
+- увидеть сырые таблицы и «тонны текста»;
+- генерировать SQL;
+- менять вычисленные цифры.</p>
+<p>Где происходят вычисления:
+- все метрики (Fair Price, deviation %, YoY ratio) считаются в SQL/Python на витринах;
+- агентный слой только вызывает строго разрешенные инструменты и формирует объяснение.</p>
+<h3 id="23-onprem-posture">2.3 On‑prem posture</h3>
+<ul>
+<li><code>docker-compose.yml</code>: Postgres/Redis/Adminer/Analytics API/Agent API/UI.</li>
+<li>DB и Redis доступны только локально (<code>127.0.0.1</code>), что снижает риск экспозиции.</li>
+<li>секреты в <code>.env</code>, исключены из git.</li>
+</ul>
+<h3 id="24-docker">2.4 Docker‑схема: порты, сети, маршрутизация</h3>
+<p>Ниже фиксируем «схему контейнеров» как часть сдачи, потому что для on‑prem это не менее важно, чем сама аналитика.</p>
+<p><strong>Сети</strong>
+- <code>data_net</code> (internal): слой данных (Postgres/Redis) и сервисы, которым нужно к ним обращаться.
+- <code>app_net</code>: слой приложений (API/UI), который может иметь исходящий доступ (например, для LLM‑провайдера, если он подключается).</p>
+<p><strong>Порты (локально, только loopback)</strong></p>
+<table>
+<thead>
+<tr>
+<th>Компонент</th>
+<th>Контейнер</th>
+<th style="text-align: right;">Host port</th>
+<th>Назначение</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Postgres</td>
+<td><code>goszakup_postgres</code></td>
+<td style="text-align: right;"><code>5432</code></td>
+<td>source‑of‑truth БД + FK</td>
+</tr>
+<tr>
+<td>Redis</td>
+<td><code>goszakup_redis</code></td>
+<td style="text-align: right;"><code>6379</code></td>
+<td>кэш ответов/подсказок, infra</td>
+</tr>
+<tr>
+<td>Adminer</td>
+<td><code>goszakup_adminer</code></td>
+<td style="text-align: right;"><code>8080</code></td>
+<td>UI для DB (dev)</td>
+</tr>
+<tr>
+<td>Analytics API</td>
+<td><code>goszakup_analytics_api</code></td>
+<td style="text-align: right;"><code>8001</code></td>
+<td>read‑only доступ к витринам/поиску</td>
+</tr>
+<tr>
+<td>Agent API</td>
+<td><code>goszakup_agent_api</code></td>
+<td style="text-align: right;"><code>8002</code></td>
+<td>строгий агент: NL → tools → ответ</td>
+</tr>
+<tr>
+<td>Streamlit UI</td>
+<td><code>goszakup_ui</code></td>
+<td style="text-align: right;"><code>8501</code></td>
+<td>демонстрационный интерфейс</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Ключевой принцип безопасности</strong>: все порты проброшены как <code>127.0.0.1:&lt;port&gt;</code>, то есть недоступны из внешней сети по умолчанию.</p>
+<h3 id="25-request-path-endtoend">2.5 Request path: как проходит один запрос пользователя (end‑to‑end)</h3>
+<p><strong>Интерактивный запрос (UI → Agent)</strong></p>
+<pre><code class="language-text">User (browser)
+  -&gt; Streamlit UI :8501
+     -&gt; POST Agent API /ask (или /query) :8002
+        -&gt; AgentWorkflow: intent → tool whitelist → cache → compute
+           -&gt; DuckDB (read-only analytics.duckdb)
+           -&gt; (опционально) Redis cache
+        -&gt; structured JSON response (verdict/params/analytics/top_k/evidence)
+     -&gt; UI renders L0–L4 + top‑K cards/tables
+</code></pre>
+<p><strong>Запрос для подсказок и аналитического поиска (UI → Analytics API)</strong></p>
+<pre><code class="language-text">UI
+  -&gt; POST Analytics API /search or /anomaly :8001
+     -&gt; DuckDB marts
+     -&gt; items[] (structured records)
+</code></pre>
+<p><strong>Поток данных (ETL → marts)</strong></p>
+<pre><code class="language-text">OWS v3 REST
+  -&gt; ETL loaders (host-run or container)
+     -&gt; PostgreSQL normalized tables (+ raw landing)
+        -&gt; analytics/export_parquet.py (incremental)
+           -&gt; Parquet files (per table)
+              -&gt; analytics/build_marts.py
+                 -&gt; DuckDB: market_price_stats, lot_fair_price_eval, anomalies...
+</code></pre>
+<h3 id="26-github">2.6 Ссылки на ключевые файлы репозитория (для публикации в GitHub)</h3>
+<p>Ниже приведены основные точки входа и ключевые компоненты, на которые опирается архитектура и демонстрация. Ссылки указаны как относительные пути и будут кликабельны в GitHub.</p>
+<table>
+<thead>
+<tr>
+<th>Область</th>
+<th>Назначение</th>
+<th>Файл(ы)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Инфраструктура</td>
+<td>Docker Compose (порты/сети/сервисы)</td>
+<td><a href="../docker-compose.yml"><code>docker-compose.yml</code></a></td>
+</tr>
+<tr>
+<td>Инфраструктура</td>
+<td>Bootstrap/setup окружения</td>
+<td><a href="../setup.sh"><code>setup.sh</code></a></td>
+</tr>
+<tr>
+<td>База данных</td>
+<td>Инициализация схемы PostgreSQL</td>
+<td><a href="../infra/postgres/init.sql"><code>infra/postgres/init.sql</code></a></td>
+</tr>
+<tr>
+<td>Проверки</td>
+<td>Connectivity gate (env/postgres/redis/OWS)</td>
+<td><a href="../scripts/check_connections.py"><code>scripts/check_connections.py</code></a></td>
+</tr>
+<tr>
+<td>Spiral 2</td>
+<td>Оркестрация ingestion (ядро + enrichment + verify)</td>
+<td><a href="../scripts/run_spiral2.sh"><code>scripts/run_spiral2.sh</code></a></td>
+</tr>
+<tr>
+<td>ETL (ядро)</td>
+<td>Refs/Plans/Announcements/Lots/Contracts/Items</td>
+<td><a href="../etl/load_refs.py"><code>etl/load_refs.py</code></a>, <a href="../etl/load_plans.py"><code>etl/load_plans.py</code></a>, <a href="../etl/load_announcements.py"><code>etl/load_announcements.py</code></a>, <a href="../etl/load_lots.py"><code>etl/load_lots.py</code></a>, <a href="../etl/load_contracts.py"><code>etl/load_contracts.py</code></a>, <a href="../etl/load_contract_items.py"><code>etl/load_contract_items.py</code></a></td>
+</tr>
+<tr>
+<td>ETL (enrichment)</td>
+<td>KATO/spec/acts/treasury + events + repairs</td>
+<td><a href="../etl/load_plans_kato_incremental.py"><code>etl/load_plans_kato_incremental.py</code></a>, <a href="../etl/load_plans_spec_incremental.py"><code>etl/load_plans_spec_incremental.py</code></a>, <a href="../etl/load_acts_incremental.py"><code>etl/load_acts_incremental.py</code></a>, <a href="../etl/load_treasury_pay_incremental.py"><code>etl/load_treasury_pay_incremental.py</code></a>, <a href="../etl/load_trd_buy_process_events_incremental.py"><code>etl/load_trd_buy_process_events_incremental.py</code></a>, <a href="../etl/backfill_announcements_from_sources.py"><code>etl/backfill_announcements_from_sources.py</code></a></td>
+</tr>
+<tr>
+<td>ETL (общие)</td>
+<td>Клиент OWS + утилиты нормализации/ensure_*</td>
+<td><a href="../etl/client.py"><code>etl/client.py</code></a>, <a href="../etl/utils.py"><code>etl/utils.py</code></a>, <a href="../etl/config.py"><code>etl/config.py</code></a></td>
+</tr>
+<tr>
+<td>Macro indices</td>
+<td>Национальные константы CPI/GDP (2024–2026)</td>
+<td><a href="../etl/load_macro_indices.py"><code>etl/load_macro_indices.py</code></a></td>
+</tr>
+<tr>
+<td>Analytics</td>
+<td>Export Parquet + build marts + query engine</td>
+<td><a href="../analytics/export_parquet.py"><code>analytics/export_parquet.py</code></a>, <a href="../analytics/build_marts.py"><code>analytics/build_marts.py</code></a>, <a href="../analytics/engine.py"><code>analytics/engine.py</code></a></td>
+</tr>
+<tr>
+<td>Agent API</td>
+<td>Строгий API (FastAPI): <code>/query</code> и <code>/ask</code></td>
+<td><a href="../api/app.py"><code>api/app.py</code></a></td>
+</tr>
+<tr>
+<td>Agent core</td>
+<td>Intent → tools whitelist → cache → response</td>
+<td><a href="../agent/agent.py"><code>agent/agent.py</code></a>, <a href="../agent/intent.py"><code>agent/intent.py</code></a>, <a href="../agent/tools.py"><code>agent/tools.py</code></a>, <a href="../agent/schemas.py"><code>agent/schemas.py</code></a>, <a href="../agent/cache.py"><code>agent/cache.py</code></a></td>
+</tr>
+<tr>
+<td>Services</td>
+<td>Контейнерные entrypoints: analytics/agent/ui</td>
+<td><a href="../services/analytics_api/main.py"><code>services/analytics_api/main.py</code></a>, <a href="../services/agent_api/main.py"><code>services/agent_api/main.py</code></a>, <a href="../services/ui/app.py"><code>services/ui/app.py</code></a></td>
+</tr>
+<tr>
+<td>Верификация</td>
+<td>Проверки Spiral 2/3 и профили качества</td>
+<td><a href="../scripts/verify_spiral2.py"><code>scripts/verify_spiral2.py</code></a>, <a href="../scripts/verify_spiral3.py"><code>scripts/verify_spiral3.py</code></a>, <a href="../scripts/check_quality_gaps.py"><code>scripts/check_quality_gaps.py</code></a>, <a href="../scripts/profile_database_snapshot.py"><code>scripts/profile_database_snapshot.py</code></a></td>
+</tr>
+<tr>
+<td>Документы</td>
+<td>Итоговая документация и демо-скрипт</td>
+<td><a href="SUBMISSION_FINAL.md"><code>docs/SUBMISSION_FINAL.md</code></a>, <a href="SUBMISSION_FINAL_v2.md"><code>docs/SUBMISSION_FINAL_v2.md</code></a>, <a href="DEMO_SCRIPT_v2.md"><code>docs/DEMO_SCRIPT_v2.md</code></a></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="3-postgresql">3) Схема хранения (PostgreSQL): сущности, связи, индексы</h2>
+<h3 id="31-fk">3.1 Почему нормализованная схема + FK</h3>
+<p>Требование «проверяемости» означает, что в системе должны быть гарантированы:
+- целостность ссылок (lot → plan_point, contract → supplier, etc);
+- воспроизводимость выборок;
+- отсутствие дубликатов;
+- ясный audit trail.</p>
+<p>Нормализованная схема позволяет строить «цепочки доказательств» без ручных склейок и без риска расхождений.</p>
+<h3 id="32">3.2 Основные таблицы ядра (минимум ТЗ)</h3>
+<ul>
+<li><code>subjects</code>: заказчики/поставщики (BIN, name_ru, флаги <code>is_customer/is_supplier</code>, RNU flag и т.д.).</li>
+<li><code>plan_points</code>: план закупок.</li>
+<li><code>announcements</code>: объявления/trd-buy.</li>
+<li><code>lots</code>: лоты.</li>
+<li><code>contracts</code>: договоры.</li>
+<li><code>contract_items</code>: позиции договора (unit_price/qty и связь с планом <code>pln_point_id</code>).</li>
+</ul>
+<p>Ключевое для lineage:
+- <code>lot_plan_points(lot_id, plan_point_id)</code> — сохраняет связь «лот ↔ план» даже если в контракте нет прямой ссылки.</p>
+<h3 id="33">3.3 Справочники</h3>
+<ul>
+<li><code>enstru_ref</code>: ЕНСТРУ (с placeholder стратегией <code>UNKNOWN</code> для новых кодов).</li>
+<li><code>units_ref</code>: единицы измерения.</li>
+<li><code>kato_ref</code>: КАТО (иерархия, parent, region mapping).</li>
+<li><code>trade_methods_ref</code>, <code>lot_statuses_ref</code>, <code>contract_statuses_ref</code>.</li>
+</ul>
+<h3 id="34">3.4 Операционные таблицы</h3>
+<ul>
+<li><code>etl_state</code>: checkpoint state для resume-by-BIN загрузок.</li>
+<li><code>etl_runs</code>: логи прогонов.</li>
+<li><code>journal_entries</code>: журнал изменений (для incremental).</li>
+<li><code>quality_snapshots</code>: метрики качества по слоям.</li>
+</ul>
+<h3 id="35-raw-landing-high-volume-endpoint">3.5 Raw landing (для high-volume endpoint’ов)</h3>
+<p>Смысл: хранить сырые payload‑срезы/события для backfill и качества, не ломая нормализованную модель.
+- <code>raw_plans_kato</code>
+- <code>raw_plans_spec</code>
+- <code>raw_acts</code>
+- <code>raw_treasury_pay</code>
+- <code>raw_trd_buy_events</code></p>
+<h3 id="36-er">3.6 ER‑схема (текстовая): связи, которые формируют «фундамент»</h3>
+<p>Ниже минимальная ER‑модель, которую можно проверить SQL’ем и которая объясняет, почему именно такие таблицы нужны для задач ТЗ.</p>
+<pre><code class="language-text">subjects(bin PK)
+  &lt;- contracts.customer_bin (FK)      # заказчик договора
+  &lt;- contracts.supplier_bin (FK)      # поставщик договора
+
+plan_points(id PK)
+  &lt;- lot_plan_points.plan_point_id (FK)
+  &lt;- contract_items.pln_point_id (FK) # позиция договора, связанная с планом
+
+announcements(id PK)                  # trd-buy id
+  &lt;- lots.announcement_id (FK)
+  &lt;- contracts.announcement_id (FK)   # если API дает прямую ссылку
+
+lots(id PK)
+  &lt;- lot_plan_points.lot_id (FK)      # связь lot-&gt;plan_point через point_list
+
+contracts(id PK)
+  &lt;- contract_items.contract_id (FK)
+
+refs: enstru_ref, units_ref, kato_ref, statuses, methods
+</code></pre>
+<p><strong>Что важно для explainability</strong>:
+- любой ответ типа «справедливость цены» должен уметь показать:
+  - «что оценивали» (лот/позиция договора);
+  - «с чем сравнивали» (выборка контрактных позиций);
+  - N и фильтры;
+  - ссылки на evidence (ID контрактов, ID объявлений, BIN субъектов).</p>
+<h3 id="37-audit-trail-plan-announcement-lot-contract">3.7 Audit trail (Plan → Announcement → Lot → Contract) как прикладная цепочка</h3>
+<p>OWS v3 не всегда дает одну «идеальную» ссылку между планом и договором. Поэтому audit trail строится как объединение нескольких каналов:
+- <code>plan_point</code> → <code>lot</code>: через <code>lots.point_list</code> (материализовано в <code>lot_plan_points</code>).
+- <code>lot</code> → <code>announcement (trd-buy)</code>: через <code>lots.announcement_id</code> (иногда восстанавливается через <code>source_trd_buy_id</code>).
+- <code>announcement</code> → <code>contract</code>: через <code>contracts.announcement_id</code> или <code>contracts.source_trd_buy_id</code> (когда доступно).
+- <code>contract</code> → <code>contract_items</code>: всегда.
+- <code>contract_items</code> → <code>plan_point</code>: через <code>pln_point_id</code> (когда заполнено).</p>
+<p>Это не «идеальная цепочка», но это честный и проверяемый способ восстановить происхождение данных и показать его пользователю.</p>
+<hr>
+<h2 id="4-etl-ingestion">4) ETL: ingestion, нормализация, инкрементальность</h2>
+<h3 id="41-endpoint-mapping">4.1 Endpoint mapping (что откуда грузим)</h3>
+<p>В реализации используются REST endpoint’ы OWS v3:
+- Subjects: <code>/v3/subject/biin/{bin}</code>
+- Plans: <code>/v3/plans/{bin}</code>, <code>/v3/plans/view/{id}</code>
+- Plans enrich: <code>/v3/plans/kato</code>, <code>/v3/plans/spec</code>
+- Announcements: <code>/v3/trd-buy/bin/{bin}</code>, <code>/v3/trd-buy/{id}</code>
+- Lots: <code>/v3/lots/bin/{bin}</code>
+- Contracts: <code>/v3/contract/customer/{bin}</code>, <code>/v3/contract/{id}/units</code>
+- Execution evidence: <code>/v3/acts</code>, <code>/v3/treasury-pay</code>
+- Process events: <code>/v3/trd-buy/{id}/cancel</code>, <code>/v3/trd-buy/{id}/pause</code>
+- Incremental: <code>/v3/journal</code>
+- Refs: <code>/v3/refs/*</code></p>
+<h3 id="42-etl">4.2 Принципы ETL</h3>
+<ul>
+<li><strong>Idempotent upsert</strong>: повторный запуск не должен делать дубли.</li>
+<li><strong>Resume</strong>: повторный запуск продолжает с места остановки.</li>
+<li><strong>Finite backstep</strong>: опционально пересчитываем только «хвост» N последних ID.</li>
+<li><strong>FK-safe</strong>: helper‑функции подготавливают refs/subjects перед вставкой.</li>
+</ul>
+<h3 id="43">4.3 Выявленные проблемы и принятые решения</h3>
+<h4 id="a-asyncpgredispandasduckdbpyarrow">Проблема A: зависимости и окружение (asyncpg/redis/pandas/duckdb/pyarrow)</h4>
+<p>На ранних этапах <code>check_connections.py</code> падал с:
+- <code>asyncpg not installed</code>;
+- <code>redis not installed</code>.</p>
+<p>Это выявило два уровня:
+- host‑venv нужен для ETL/скриптов;
+- контейнеры сервисов (agent/ui/analytics) должны иметь стабильную Python‑версию.</p>
+<p>Отдельный блок проблем возник при установке <code>pyarrow</code> на свежем Python (source builds/ошибки сборки). Подход решения:
+- закрепить контейнерные runtime на Python 3.11 (wheels доступны, сборка стабильна);
+- в README указать рекомендацию Python 3.12 на host для аналитики;
+- аналитические расчеты и витрины выполняются через сервисный слой, а не завязаны на локальную «случайную» версию Python.</p>
+<h4 id="b">Проблема B: повторные запросы и долгий прогон</h4>
+<p>В ходе загрузки лотов наблюдались повторяющиеся запросы вида:
+- многократные <code>GET /v3/trd-buy/{id}</code> для одного и того же <code>id</code>.</p>
+<p>Это приводило к:
+- замедлению загрузки;
+- лишним рискам 429/5xx.</p>
+<p>Решение:
+- in-flight coalescing в API клиенте: один запрос на <code>trd_buy_id</code> в процессе, остальные ждут его результат.
+- in-memory cache для наиболее повторяющихся lookup.</p>
+<h4 id="c-lineage-planlotcontract">Проблема C: критические разрывы lineage (plan→lot→contract)</h4>
+<p>На уровне плана были <code>point_list</code> в лотах, но не было куда записывать. Это ломало audit trail.</p>
+<p>Решение:
+- добавлен join table <code>lot_plan_points</code>.
+- загрузчик лотов записывает каждый <code>point_list</code> id в <code>lot_plan_points</code>.</p>
+<h4 id="d-fk-enstru-supplier">Проблема D: FK‑падения по ENSTRU и supplier</h4>
+<p>В реальности API возвращает коды ENSTRU и supplier BIN, которые могут отсутствовать в локальных справочниках БД.</p>
+<p>Решение:
+- <code>ensure_enstru_ref</code>: upsert placeholder (<code>UNKNOWN</code>) для новых ENSTRU.
+- <code>ensure_subject</code>: при встрече supplier BIN дергаем <code>/v3/subject/biin/{bin}</code> и upsert в <code>subjects</code>.</p>
+<p>Это устранило класс ошибок, когда ETL «умирает» на первом неизвестном значении.</p>
+<h4 id="e-payload">Проблема E: неоднозначность payload (список вместо объекта)</h4>
+<p>Фиксировалось падение вида:
+- <code>AttributeError: 'list' object has no attribute 'get'</code> в <code>ensure_subject</code>.</p>
+<p>Причина: некоторые endpoint‑ответы возвращали list‑структуры.</p>
+<p>Решение:
+- защитная нормализация: если ответ список — берем первый объект либо возвращаем structured fallback.</p>
+<h4 id="f-kato">Проблема F: KATO и региональная аналитика</h4>
+<p>Для справедливости по «идентичному городу поставки» нужны региональные признаки.</p>
+<p>Было выявлено:
+- <code>plan_points_with_kato</code> низкий (воркер <code>/v3/plans/kato</code> повышает покрытие, но не гарантирует 100%);
+- у части лотов <code>kato_delivery</code> отсутствует.</p>
+<p>Решение:
+- отдельный checkpointed воркер <code>/v3/plans/kato</code> -&gt; <code>raw_plans_kato</code> + backfill в <code>plan_points</code>.
+- <code>kato_ref</code> загружается и используется как валидатор: записываем KATO только если он существует.</p>
+<h4 id="g-ows-500-internal-server-error">Проблема G: OWS нестабильность (500 Internal Server Error)</h4>
+<p>Иногда конкретные <code>trd-buy</code> id возвращают 500.</p>
+<p>Решение:
+- retry/backoff + adaptive rate limiter (снижение RPS на ошибках).
+- для 500/неустойчивых сущностей: фиксируем ошибку в логах и продолжаем, не падая всем прогоном.</p>
+<h3 id="44-checkpointresume">4.4 Checkpoint/resume: почему повторный запуск не должен начинаться «с нуля»</h3>
+<p>Практическая проблема: ingestion занимает часы, а OWS может давать 500/429. Если любой сбой заставляет стартовать с первой страницы, процесс становится непригодным для эксплуатации.</p>
+<p>Внедрены следующие механизмы:
+- <code>etl_state</code> как таблицу checkpoint’ов.
+- <code>resume_path</code> / <code>search_after</code> как «высокую воду» по endpoint’у и BIN.
+- <code>RESUME_BACKSTEP</code> (конечный backstep) как страхующий механизм: при рестарте выполняется откат на ограниченный хвост, чтобы захватить поздние обновления, не перегоняя весь массив.</p>
+<p>Псевдокод (упрощенно):</p>
+<pre><code class="language-text">state = load_state(worker=&quot;lots&quot;, bin=BIN)
+cursor = state.resume_path or None
+while True:
+  page = GET /v3/lots/bin/{BIN}?page=next&amp;search_after=cursor
+  upsert(page.items)
+  cursor = page.next_search_after
+  save_state(cursor)
+  if not page.has_next: break
+</code></pre>
+<h3 id="45-rps-concurrency">4.5 Производительность: RPS, concurrency и борьба с повторными запросами</h3>
+<p>На первичных прогонах ingestion были выявлены два источника длительного времени выполнения:
+1) реальные объемы данных по 27 BIN;
+2) повторные lookup’и (например, <code>trd-buy/{id}</code>) для множества лотов.</p>
+<p>Решения:
+- <strong>Adaptive RPS</strong>: на ошибках (429/5xx) снижаем скорость, на стабильных ответах повышаем до безопасного предела.
+- <strong><code>--concurrency</code></strong>: параллельная обработка BIN/страниц при условии глобального rate limiter.
+- <strong>in‑flight dedupe</strong>: при одновременных запросах к одному <code>trd-buy/{id}</code> выполняется один сетевой вызов, остальные задачи ожидают его результат.</p>
+<p>Комбинация указанных мер повышает пропускную способность и делает прогон управляемым: процесс допускает остановку и последующий restart без потери значимого времени.</p>
+<h3 id="46-strict-recovery-pass">4.6 Strict recovery pass (когда нужно чинить качество без разрушения целостности)</h3>
+<p>При выявлении пропусков (KATO, ENSTRU, announcement links, <code>pln_point_id</code>) полный перезалив данных не выполняется; применяется строго определенная восстановительная процедура:
+- сначала прогоняем enrichment‑workers (например, <code>/v3/plans/kato</code>);
+- затем делаем repair циклы по источникам (announcements from <code>source_trd_buy_id</code>);
+- затем точечно запускаем загрузчики в режиме <code>--repair-missing</code> (контрактные позиции, linkage).</p>
+<p>Преимущество: сохраняется идемпотентность и FK‑целостность, а качество улучшается итеративно.</p>
+<h3 id="47">4.7 Нормализация и очистка текстовых полей (минимум, повышающий качество)</h3>
+<p>ТЗ прямо требует очистку и нормализацию. На практике это не единая универсальная функция, а набор устойчивых правил, которые:
+- уменьшают количество шумовых/мусорных токенов в текстовых полях;
+- повышают повторное использование справочников;
+- улучшают качество поиска и группировок;
+- делают входы в аналитику более стабильными.</p>
+<p>Что сделано в рамках MVP (и почему этого достаточно для прототипа):</p>
+<p><strong>1) Нормализация названий (<code>name_clean</code>)</strong>
+- Сохраняется оригинальный <code>name_ru</code> (как в API).
+- Параллельно рассчитывается <code>name_clean</code> (lowercase, удаление пунктуации, схлопывание пробелов) через <code>etl/utils.py:normalize_name</code>.
+- Это полезно для: простого полнотекстового поиска, дедупликации и «грязных» имен (например, <code>\"Лот №...\"</code>, двойные пробелы, скобки).</p>
+<p><strong>2) Приведение типов и безопасный парсинг</strong>
+- <code>safe_int</code>, <code>safe_float</code>, <code>parse_dt</code> защищают ingestion от «дрейфа payload» (строка вместо числа, пустые значения).
+- Это снижает количество падений ETL и превращает «битые поля» в управляемые <code>NULL</code>, которые дальше учитываются в <code>quality_gaps</code>.</p>
+<p><strong>3) Единицы измерения как справочник (<code>units_ref</code>)</strong>
+- Если встречается неизвестный <code>unit_code</code>, ingestion не прерывается; добавляется placeholder <code>UNKNOWN_UNIT_&lt;code&gt;</code>.
+- Это сохраняет целостность и позволяет позднее «обогатить» справочник без пересборки всей модели.</p>
+<p><strong>4) Валидация цены (MVP)</strong>
+- В <code>contract_items</code> сохраняются <code>unit_price</code>, <code>quantity</code>, <code>total_price</code>.
+- Флаг <code>is_price_valid</code> в MVP выставляется как минимум при наличии <code>quantity</code> и <code>unit_price</code>.
+- Аналитика (<code>market_price_stats</code>, Fair Price) считает статистику только по <code>is_price_valid=TRUE</code>.</p>
+<p>Важно: это намеренно консервативная стратегия. Для production‑качества целесообразно добавить:
+- проверки <code>quantity &gt; 0</code>, <code>unit_price &gt; 0</code>;
+- отсечение экстремальных значений по бизнес‑правилам (например, min/max thresholds);
+- вычисление <code>unit_price = total/qty</code> как fallback, если API дает только сумму.</p>
+<p>Инженерный смысл подхода: лучше иметь меньше строк, но с проверяемыми цифрами, чем «много всего», где половина цен невалидна и ломает статистику.</p>
+<hr>
+<h2 id="5-gate">5) Контроль качества данных: метрики и gate‑проверки</h2>
+<h3 id="51">5.1 Автоматизированные проверки</h3>
+<p>Проверки закреплены в скриптах:
+- <code>scripts/verify_spiral2.py</code>:
+  - наличие ключевых таблиц;
+  - FK violations == 0;
+  - duplicates == 0.</p>
+<ul>
+<li><code>scripts/verify_spiral3.py</code>:</li>
+<li>наличие и непустота витрин в DuckDB;</li>
+<li>
+<p>базовая готовность analytics.</p>
+</li>
+<li>
+<p><code>scripts/check_quality_gaps.py</code>:</p>
+</li>
+<li>coverage метрики по ключевым полям (ENSTRU, KATO, linkage).</li>
+</ul>
+<h3 id="52-20260302">5.2 Текущее состояние (факт на 2026‑03‑02)</h3>
+<p>Выдержка из последнего прогона:</p>
+<p><strong>Integrity / Spiral 2</strong>
+- <code>plan_points: 31670</code>
+- <code>announcements: 37178</code>
+- <code>lots: 98156</code>
+- <code>lot_plan_points: 967</code>
+- <code>contracts: 14762</code>
+- <code>contract_items: 713</code>
+- FK violations: 0
+- PK duplicates: 0</p>
+<p><strong>Analytics / Spiral 3</strong>
+- <code>macro_indices: 3</code>
+- <code>market_price_stats: 348</code>
+- <code>lot_fair_price_eval: 712</code>
+- <code>lot_anomalies: 24</code></p>
+<p><strong>Quality gaps</strong>
+- <code>lots_with_enstru: 1896 / 98156 (1.93%)</code>
+- <code>lots_with_kato: 18536 / 98156 (18.88%)</code>
+- <code>plan_points_with_kato: 866 / 31670 (2.73%)</code>
+- <code>contract_items_total: 713</code></p>
+<p>Инженерный вывод:
+- pipeline целостен и воспроизводим;
+- главная зона роста — полнота данных (особенно contract_items и региональная детализация).</p>
+<h3 id="53-null">5.3 Что означают «null значения» и почему это не просто косметика</h3>
+<p>Для объективной оценки качества зафиксирован snapshot профиля БД (<code>artifacts/db_snapshot_.../SUMMARY.md</code>) и проанализированы наиболее проблемные поля.</p>
+<p><strong>Примеры полей с высокой долей null (и почему это влияет на аналитику)</strong>
+- <code>plan_points.kato_delivery</code> (≈97% null): означает, что «идентичный город поставки» часто нельзя обеспечить напрямую из plan_points. Нужен отдельный enrichment endpoint <code>/v3/plans/kato</code> и, в идеале, дополнительная нормализация адресов.
+- <code>lots.enstru_code</code> (≈99% null): если ENSTRU не приходит в lot payload, то справедливость цены по «лоту» приходится вычислять через <code>contract_items</code> или через <code>plan_points</code> (если связь заполнена).
+- <code>lots.announcement_id</code> (≈62% null): ломает прямые ссылки на портал и ухудшает аудит. Данный дефицит компенсируется полем <code>source_trd_buy_id</code> и repair‑циклом объявлений.
+- <code>lots.kato_delivery</code> (≈81% null): делает региональную компоненту Fair Price слабой; это напрямую снижает confidence.
+- <code>contracts.lot_id</code> (100% null): не ошибка ETL, а показатель того, что OWS не дает прямой «лот → договор» связи в форме, пригодной для FK.</p>
+<p><strong>Как обеспечено управляемое улучшение качества</strong>
+- пропуски не скрываются: они становятся частью <code>limitations</code> и <code>confidence</code>;
+- добавлена «лестница фоллбеков» (region→national, year→±1 year);
+- сделали enrichment worker’ы и recovery pass, которые поднимают покрытие без full rescan.</p>
+<p>Это важно для защиты: комиссия быстро поймет, что система не «рисует метрики», а честно показывает границы данных и предоставляет пути улучшения.</p>
+<h3 id="54-kpi-85-facts">5.4 KPI точности 85% (facts) и методика измерения</h3>
+<p>ТЗ требует: точность извлечения фактов (цифры, даты, БИН) не менее 85%. Это не про «красивые тексты», а про проверяемые значения.</p>
+<p>Показатель трактуется следующим образом:
+- <strong>извлечение параметров</strong> из вопроса (ЕНСТРУ, BIN, период, порог, top‑k) должно быть стабильным;
+- <strong>цифры ответа</strong> должны совпадать с результатами tools (DuckDB/SQL);
+- <strong>LLM (если используется)</strong> не имеет права менять цифры, а только оформляет текст.</p>
+<p>Что уже сделано и что добавляется в submission‑контуре:
+- есть <code>tests/test_canonical.py</code>, где intent‑классификация и маршрутизация проверяются на «канонических» запросах (включая <code>AUDIT_TRAIL</code>, <code>VOLUME</code> и <code>PRICE_CHECK</code>);
+- есть тест <code>test_no_hallucination_on_structured_output</code>, который подтверждает: при подмене tool‑ответа цифры в финальном ответе совпадают с tool‑данными (то есть агент не «галлюцинирует»);
+- для формального KPI 85% подготавливается небольшой labeled set (20–50 вопросов) и рассчитывается точность:
+  - exact match по extracted параметрам (например, BIN и год);
+  - exact match по ключевым числам ответа (N, median, deviation %) с допустимой погрешностью округления.</p>
+<p>Данный подход является корректной инженерной позицией для комиссии: не декларируются недоказуемые свойства модели, вместо этого демонстрируется измеримый критерий и способ его воспроизведения.</p>
+<hr>
+<h2 id="6-duckdb-marts">6) Аналитический слой (DuckDB marts): что и как считаем</h2>
+<h3 id="61-duckdb-parquet">6.1 Почему DuckDB + Parquet</h3>
+<ul>
+<li>Postgres — «истина» и операционное хранилище.</li>
+<li>DuckDB — быстрый OLAP слой, упрощающий витрины, оконные функции и массовую агрегацию.</li>
+<li>Parquet — стабильный формат обмена и базовый building block для on‑prem аналитики.</li>
+</ul>
+<h3 id="62-macro-indices-cpi">6.2 Macro indices и CPI</h3>
+<p>Добавлена таблица <code>macro_indices</code> как национальные константы на 2024–2026 (inflation, GDP growth). Это закрывает требование «временного фактора» без внешних API во время демо.</p>
+<p>Из них строится CPI index:
+- 2024 = 1.000
+- 2025/2026 — цепочка по инфляции.</p>
+<h3 id="63-fair-price">6.3 Fair Price</h3>
+<p>Формализация:
+- baseline: median unit price по сопоставимым <code>enstru_code + unit_code + region + year</code>.
+- корректировки:
+  - <code>K_time</code> (CPI);
+  - <code>K_region=1.0</code> (пока);
+  - <code>K_vol=1.0</code> (MVP placeholder).</p>
+<p>Fallback ladder:
+1) same region + same year<br>
+2) national + same year<br>
+3) same region ±1 year<br>
+4) national ±1 year</p>
+<p>Вердикт:
+- <code>anomaly</code> при отклонении &gt; 30%;
+- <code>insufficient_data</code> если N &lt; 20 на всех уровнях;
+- <code>ok</code> иначе.</p>
+<h3 id="64">6.4 Аномалии</h3>
+<ul>
+<li><strong>Price anomalies</strong>: результат <code>lot_fair_price_eval</code> материализуется в <code>lot_anomalies</code>.</li>
+<li><strong>Volume anomalies</strong>: <code>volume_anomalies</code> (YoY ratio &gt;= 1.5).</li>
+</ul>
+<h3 id="65">6.5 Что именно лежит в витринах (и как это связано с инструментами агента)</h3>
+<p>Витрина нужна не «для графиков», а как слой, который делает ответы воспроизводимыми и быстрыми.</p>
+<p><strong><code>market_price_stats</code></strong>
+- гранулярность: <code>enstru_code + unit_code + region_id + year</code>.
+- метрики: <code>n</code>, <code>median</code>, <code>mean</code>, <code>p10/p25/p75/p90</code>, <code>iqr</code>, <code>min/max</code>.
+- источник: <code>contract_items</code> (только <code>is_price_valid=TRUE</code>).</p>
+<p><strong><code>lot_fair_price_eval</code></strong>
+- гранулярность: одна строка на <code>contract_item_id</code>.
+- поля: <code>actual_unit_price</code>, <code>expected_unit_price</code>, <code>deviation_pct</code>, <code>verdict</code>, <code>fallback_level</code>, <code>confidence</code>, <code>ref_n</code>.
+- смысл: «все вычисления уже сделаны», агент только выбирает что показать и как объяснить.</p>
+<p><strong><code>lot_anomalies</code></strong>
+- выборка из <code>lot_fair_price_eval</code> с <code>abs(deviation_pct) &gt;= 30</code> (или заданным порогом).
+- обогащается связанной информацией (BIN заказчика/поставщика, дата, ссылки).</p>
+<p><strong><code>volume_anomalies</code></strong>
+- агрегаты по <code>customer_bin + enstru_code + year</code> с YoY‑отношением и порогами (<code>min_prev_qty</code>).</p>
+<p>Таким образом, whitelist tools агента не «изобретают SQL на лету», а читают заранее построенные детерминированные витрины.</p>
+<hr>
+<h2 id="7-ai-agentic">7) Логика AI‑агента (строгая agentic архитектура)</h2>
+<h3 id="71-llm-sql">7.1 Почему «строгий агент», а не «попросим LLM написать SQL»</h3>
+<p>Для госаналитики критично:
+- отсутствие SQL‑инъекций;
+- отсутствие «галлюцинаций»;
+- воспроизводимость ответа.</p>
+<p>Поэтому реализован strict workflow:</p>
+<p>1) Intent classification (8 типов).<br>
+2) Валидация параметров (Pydantic).<br>
+3) Tool selection только из whitelist.<br>
+4) Cache check.<br>
+5) Tool execution (fixed SQL templates).<br>
+6) Structured response L0–L4 + ссылки.</p>
+<p>LLM как компонент не обязателен для вычислений; при добавлении LLM она получает только структурированный JSON и не может менять цифры.</p>
+<h3 id="72-intent-types">7.2 Intent types</h3>
+<ul>
+<li><code>PRICE_CHECK</code></li>
+<li><code>ORG_SUMMARY</code></li>
+<li><code>ANOMALY_SCAN</code></li>
+<li><code>SUPPLIER_CHECK</code></li>
+<li><code>AUDIT_TRAIL</code></li>
+<li><code>PLAN_VS_FACT</code></li>
+<li><code>TOP_K</code></li>
+<li><code>COVERAGE_GAPS</code></li>
+</ul>
+<h3 id="73-whitelist">7.3 Инструменты (whitelist)</h3>
+<ul>
+<li><code>get_fair_price</code></li>
+<li><code>get_org_summary</code></li>
+<li><code>get_anomalies</code></li>
+<li><code>get_supplier_profile</code></li>
+<li><code>get_audit_trail</code></li>
+<li><code>get_plan_execution</code></li>
+<li><code>get_top_k</code> (в т.ч. <code>volume_anomalies</code>)</li>
+<li><code>get_uncontracted_plans</code></li>
+</ul>
+<h3 id="74">7.4 Ошибки агентного слоя, выявленные в ходе тестирования и эксплуатации</h3>
+<h4 id="_2">Ошибка: аудит‑трейл парсил «а» вместо номера договора</h4>
+<p>Запрос <code>История договора №24764966</code> резолвился неверно, потому что regex выхватывал хвост слова «договора».</p>
+<p>Фикс:
+- обновили regex на устойчивый вариант <code>договор(а|у|ом|е)?</code>.
+- добавили регрессионный тест.</p>
+<h4 id="top-5-intent-top_k">Ошибка: <code>top 5</code> ломал intent (уходило в TOP_K)</h4>
+<p>Если в запрос добавить <code>top 5</code>, классификатор выбирал intent TOP_K.</p>
+<p>Фикс для демо:
+- presets в UI убрали <code>top</code> в обязательных кейсах.
+- (в roadmap) можно улучшить classifier приоритетами или отдельным параметром <code>limit</code> в intents.</p>
+<h4 id="_3">Ошибка: объемы не маршрутизировались</h4>
+<p>Фраза «завышение количества» не определялась.</p>
+<p>Фикс:
+- добавили volume-route: запросы про объемы направляются в <code>TOP_K</code> с <code>dimension=volume_anomalies</code>.</p>
+<h3 id="75">7.5 Контракт ответа (исключение «галлюцинаций»)</h3>
+<p>Вместо «текста от модели» используется структурированный ответ, где:
+- все числа приходят из tool‑результата (DuckDB/SQL);
+- агент форматирует, но не вычисляет;
+- каждый ответ содержит evidence и ограничения.</p>
+<p>Шаблон ответа (сокращенно):</p>
+<pre><code class="language-json">{
+  &quot;intent&quot;: &quot;PRICE_CHECK&quot;,
+  &quot;verdict&quot;: &quot;ok | anomaly | insufficient_data&quot;,
+  &quot;confidence&quot;: &quot;HIGH | MEDIUM | LOW&quot;,
+  &quot;parameters&quot;: { &quot;enstru_code&quot;: &quot;...&quot;, &quot;region_id&quot;: &quot;...&quot;, &quot;period_from&quot;: 2024, &quot;period_to&quot;: 2024 },
+  &quot;analytics&quot;: { &quot;n&quot;: 34, &quot;median&quot;: 285000, &quot;iqr&quot;: 42000, &quot;fallback_level&quot;: 2, &quot;method&quot;: &quot;Median + IQR&quot; },
+  &quot;top_k&quot;: [ { &quot;contract_id&quot;: 123, &quot;unit_price&quot;: 290000, &quot;portal_announce_url&quot;: &quot;...&quot; } ],
+  &quot;limitations&quot;: [ &quot;missing_kato_on_81pct_lots&quot; ],
+  &quot;freshness_ts&quot;: &quot;2026-03-02T...&quot;
+}
+</code></pre>
+<p>Этот формат закрывает ключевое требование ТЗ: «Запрещено домысливание и ответы без цифровых показателей».</p>
+<hr>
+<h2 id="8-ui-streamlit">8) UI (Streamlit) как финальный слой презентации</h2>
+<p>Требование комиссии: быстрый и понятный способ интерактивно ознакомиться с системой.</p>
+<p>UI на <code>http://127.0.0.1:8501</code> показывает:
+- presets под обязательные сценарии;
+- L0–L4 вкладки;
+- KPI‑панель;
+- Top‑K evidence.</p>
+<p>Для аномалий добавили отдельный формат:
+- Top‑K отображается табличным списком с enrichment из вторичных таблиц (customer/supplier names, RNU flag, contract/announcement metadata, ссылки).</p>
+<p>Ранее пойманный UI‑баг:
+- <code>DuplicateWidgetID</code> (одинаковые кнопки без unique key).
+Фикс:
+- явные <code>key=...</code>.</p>
+<h3 id="81-ui">8.1 Значимость UI для защиты (состав демонстрации)</h3>
+<p>В гос‑контексте «красивый интерфейс» не самоцель. UI должен:
+- быстро демонстрировать, что система работает end‑to‑end;
+- показывать структуру ответа в требуемом формате (Вердикт → Параметры → Аналитика → Уверенность → Top‑K);
+- давать review‑команде возможность кликнуть на evidence и проверить цифры.</p>
+<p>UI реализован в «строгом и аналитичном» стиле:
+- темная/светлая тема;
+- KPI‑панель и компактные карточки Top‑K;
+- готовые presets под обязательные сценарии из ТЗ;
+- отдельный режим показа аномалий с enrichment из вторичных таблиц.</p>
+<hr>
+<h2 id="9">9) Нефункциональные требования</h2>
+<h3 id="91">9.1 Контроль качества</h3>
+<ul>
+<li>регулярные snapshots (<code>quality_snapshots</code> + artifacts);</li>
+<li>верификация integrity и analytics;</li>
+<li>строгие recovery‑скрипты.</li>
+</ul>
+<h3 id="92">9.2 Защита токенов</h3>
+<ul>
+<li><code>.env</code> исключен из git;</li>
+<li>токены в логах маскируются;</li>
+<li>сервисы bound на loopback;</li>
+<li>сеть <code>data_net</code> изолирована.</li>
+</ul>
+<h3 id="93-onprem-deployment">9.3 On‑prem deployment</h3>
+<ul>
+<li>Docker Compose — рабочий baseline;</li>
+<li>легко переносится в Kubernetes:</li>
+<li>Postgres/Redis/Agent/Analytics/UI как отдельные deployment;</li>
+<li>секреты как k8s secrets;</li>
+<li>ingress (Nginx) и auth/rate limit как hardening.</li>
+</ul>
+<h3 id="94">9.4 Наблюдаемость и управляемость (минимум, но достаточно для прототипа)</h3>
+<p>Prometheus/Grafana на ранних этапах намеренно не внедрялись; при этом обеспечен практический минимум:
+- структурированные логи ingestion и worker’ов (видно endpoint, BIN, курсор/страницу, retry/backoff);
+- таблицы <code>etl_runs</code> и <code>etl_state</code> как «журнал прогресса»;
+- артефакты‑снапшоты качества (<code>artifacts/quality_*.json</code>, <code>artifacts/quality_baseline_*.txt</code>).</p>
+<p>Для on‑prem production‑варианта это расширяется стандартным образом: метрики RPS/latency, алерты на рост 500/429, мониторинг свежести данных и доли null по критическим полям.</p>
+<h3 id="95">9.5 Минимизация данных и защита секретов (что важно именно для гос‑контекста)</h3>
+<p>В проекте безопасность заложена «по умолчанию», поскольку даже MVP может быть запущен в закрытом контуре.</p>
+<p><strong>Секреты</strong>
+- токены и пароли не хранятся в коде: только через <code>.env</code> (и <code>.env</code> исключен из git);
+- в диагностических скриптах показываем токены только в маскированном виде;
+- сервисы не слушают <code>0.0.0.0</code> и не публикуют порты наружу без явного решения.</p>
+<p><strong>Минимизация данных в agentic слое</strong>
+- LLM/шаблонизатор получает только агрегаты и ссылки на evidence, но не «сырой текст» закупок;
+- поля типа <code>email/phone/website</code> (если попали через <code>subject</code>) не являются частью аналитических ответов и не выводятся в UI/agent по умолчанию;
+- вычисления (Fair Price, аномалии, YoY) выполняются вне LLM и возвращаются в структуре JSON.</p>
+<p>Эти решения напрямую закрывают риск «модель увидела лишнее» и соответствуют ожиданиям к системам, которые потенциально работают с государственными данными.</p>
+<hr>
+<h2 id="10">10) Финальная презентация (как защищать проект)</h2>
+<p>Ниже структура «защиты» на 7–10 минут, которую можно использовать как устный скрипт и как структуру слайдов.</p>
+<h3 id="101-slide-1-problem-constraints">10.1 Slide 1: Problem &amp; Constraints</h3>
+<ul>
+<li>госданные, проверяемость, explainability.</li>
+</ul>
+<h3 id="102-slide-2-architecture">10.2 Slide 2: Architecture</h3>
+<ul>
+<li>diagram <code>OWS -&gt; ETL -&gt; Postgres -&gt; DuckDB -&gt; APIs -&gt; UI</code>.</li>
+</ul>
+<h3 id="103-slide-3-storage-schema">10.3 Slide 3: Storage schema</h3>
+<ul>
+<li>сущности и связи;</li>
+<li><code>lot_plan_points</code> как ключевой lineage слой.</li>
+</ul>
+<h3 id="104-slide-4-etl-reliability">10.4 Slide 4: ETL reliability</h3>
+<ul>
+<li>checkpoint <code>etl_state</code>;</li>
+<li>incremental workers;</li>
+<li>как переживаем падения.</li>
+</ul>
+<h3 id="105-slide-5-analytics-fair-price-anomalies">10.5 Slide 5: Analytics (Fair Price + anomalies)</h3>
+<ul>
+<li>формула;</li>
+<li>fallback ladder;</li>
+<li><code>insufficient_data</code> как first‑class outcome.</li>
+</ul>
+<h3 id="106-slide-6-agentic-control">10.6 Slide 6: Agentic control</h3>
+<ul>
+<li>intent whitelist;</li>
+<li>запрет SQL;</li>
+<li>structured output.</li>
+</ul>
+<h3 id="107-slide-7-live-demo">10.7 Slide 7: Live demo</h3>
+<p>Три обязательных кейса:
+1) Fairness:
+<code>Оцени адекватность цены лота № 32899983 относительно аналогичных контрактов других ведомств в идентичном городе поставки</code></p>
+<p>2) Price anomalies:
+<code>Найди закупки с отклонением цены &gt;30% по ЕНСТРУ 331312.100.000000 за 2024 год</code></p>
+<p>3) Volume anomalies:
+<code>Выяви нетипичное завышение количества ТРУ по сравнению с предыдущими годами по ЕНСТРУ 172213.000.000002 за 2025 год</code></p>
+<p>Плюс audit trail:
+<code>История договора №24764966</code></p>
+<h3 id="108-slide-8-risks-next-steps">10.8 Slide 8: Risks &amp; Next steps</h3>
+<ul>
+<li>честно показать quality gaps;</li>
+<li>план повышения coverage;</li>
+<li>формальный benchmark на 85% fact accuracy.</li>
+</ul>
+<hr>
+<h2 id="11">11) Перечень ошибок/челленджей и решений (краткая таблица)</h2>
+<table>
+<thead>
+<tr>
+<th>Категория</th>
+<th>Симптом</th>
+<th>Причина</th>
+<th>Решение</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Env deps</td>
+<td><code>asyncpg not installed</code></td>
+<td>неполная venv</td>
+<td><code>requirements.txt</code> + setup/README</td>
+</tr>
+<tr>
+<td>PyArrow</td>
+<td>source build errors</td>
+<td>несовместимость версий</td>
+<td>контейнерный runtime 3.11 + host 3.12 рекомендация</td>
+</tr>
+<tr>
+<td>API perf</td>
+<td>повтор <code>trd-buy/{id}</code></td>
+<td>параллельные fetch</td>
+<td>in-flight dedupe cache</td>
+</tr>
+<tr>
+<td>Lineage</td>
+<td>теряется plan→lot→contract</td>
+<td>нет join table</td>
+<td><code>lot_plan_points</code></td>
+</tr>
+<tr>
+<td>FK failures</td>
+<td>неизвестный ENSTRU/supplier</td>
+<td>refs не загружены</td>
+<td><code>ensure_enstru_ref</code>, <code>ensure_subject</code></td>
+</tr>
+<tr>
+<td>Payload drift</td>
+<td>list вместо dict</td>
+<td>вариативность API</td>
+<td>normalize/guard</td>
+</tr>
+<tr>
+<td>OWS 500</td>
+<td>endpoint нестабилен</td>
+<td>серверная ошибка</td>
+<td>retry/backoff + adaptive rps</td>
+</tr>
+<tr>
+<td>Agent parsing</td>
+<td>audit id =&gt; <code>а</code></td>
+<td>regex bug</td>
+<td>фикс regex + тест</td>
+</tr>
+<tr>
+<td>UI</td>
+<td>DuplicateWidgetID</td>
+<td>одинаковые кнопки</td>
+<td>уникальные keys</td>
+</tr>
+<tr>
+<td>Volume intent</td>
+<td>не определяется</td>
+<td>classifier gaps</td>
+<td>volume-route -&gt; <code>volume_anomalies</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="12_1">12) Артефакты сдачи (что именно сдаем)</h2>
+<p>Документы:
+- <code>docs/SUBMISSION_FINAL.docx</code> (полная версия)
+- <code>docs/SUBMISSION_FINAL_v2.docx</code> (версия для защиты)
+- <code>docs/DEMO_SCRIPT_v2.docx</code> (скрипт демо)</p>
+<p>Доказательства:
+- <code>scripts/verify_spiral2.py</code> / <code>scripts/verify_spiral3.py</code>
+- <code>scripts/check_quality_gaps.py</code>
+- <code>artifacts/demo_cases/*.json</code></p>
+<h3 id="121">12.1 Как воспроизвести результаты (короткий чек‑лист)</h3>
+<p>Этот проект сделан так, чтобы reviewer мог повторить ключевые шаги без дополнительных ручных действий и неформализованных операций.</p>
+<p>1) Поднять инфраструктуру:
+- <code>./setup.sh up</code> (или <code>docker compose up -d</code>)
+- проверить связность: <code>python scripts/check_connections.py</code></p>
+<p>2) Прогнать ingestion (Spiral 2, resume‑safe):
+- <code>./scripts/run_spiral2.sh --concurrency 10</code>
+- (опционально) точечный прогон: <code>./scripts/run_spiral2.sh --bins 100140011059 --limit 50</code></p>
+<p>3) Пересобрать витрины (Spiral 3):
+- <code>python analytics/export_parquet.py</code>
+- <code>python analytics/build_marts.py</code>
+- проверить: <code>python scripts/verify_spiral3.py</code></p>
+<p>4) Открыть демо и выполнить обязательные кейсы ТЗ:
+- <code>docker compose up -d analytics_api agent_api ui</code>
+- открыть <code>http://127.0.0.1:8501</code> и запустить кейсы из блока пресетов (Fairness/Anomalies/Volume/Audit).</p>
+<hr>
+<h2 id="13">13) Вывод</h2>
+<p>Реализован end‑to‑end прототип с устойчивым ingestion, нормализованным хранилищем и строгим агентным контуром, где все числовые значения рассчитываются воспроизводимо и снабжаются доказательствами.</p>
+<p>Ключевой remaining gap — повышение полноты полей и объема <code>contract_items</code> для роста статистической силы регионального Fair Price и для достижения формального KPI точности (&gt;=85% на labeled set).</p></body></html>

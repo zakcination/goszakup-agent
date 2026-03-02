@@ -1,0 +1,233 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.45;font-size:12pt;color:#111;}
+h1{font-size:22pt;margin:0 0 12px 0;}
+h2{font-size:16pt;margin:18px 0 8px 0;}
+h3{font-size:13pt;margin:14px 0 6px 0;}
+code,pre{font-family:Menlo,Consolas,monospace;font-size:10pt;}
+pre{background:#f5f7fa;padding:8px;border:1px solid #dbe2ea;}
+table{border-collapse:collapse;width:100%;margin:8px 0;}
+th,td{border:1px solid #c8d1dc;padding:6px;vertical-align:top;}
+th{background:#eef2f7;}
+</style></head><body><h1>AI-Агент Анализа Госзакупок РК</h1>
+<h2>Submission v2 (Defense Edition)</h2>
+<p>Версия: 2.0<br />
+Дата: 2026-03-02<br />
+Проект: <code>goszakup-agent</code></p>
+<hr />
+<h2>Executive Summary</h2>
+<p>Проект реализует production-like прототип AI-агента для госзакупок РК на данных OWS v3 с архитектурой <code>API -&gt; ETL -&gt; PostgreSQL -&gt; DuckDB marts -&gt; Agent API -&gt; UI</code>.</p>
+<p>Система уже умеет:
+- принимать RU/KZ запросы;
+- автоматически определять тип аналитического запроса;
+- вычислять показатели только через SQL/Python (без «выдумывания» чисел LLM);
+- выдавать explainable ответы с evidence, выборкой <code>N</code>, методом, ограничениями и Top-K ссылками.</p>
+<p>Обязательные классы ТЗ покрыты:
+- аномалии цен;
+- справедливость цены по лоту;
+- аномалии объемов (YoY).</p>
+<hr />
+<h2>1) Business Goal vs Delivered Value</h2>
+<p>Цель ТЗ: проверяемые ответы, контроль аномалий и оценка эффективности закупок.</p>
+<p>Что реализовано:
+- end-to-end контур загрузки и инкрементального обновления;
+- формализованная метрика Fair Price (с fallback-лестницей и недостаточностью данных);
+- anomaly scoring по цене и объему;
+- строгий агентный слой с whitelist инструментов и схемной валидацией входов;
+- demo UI, показывающий факты, не «общие слова».</p>
+<hr />
+<h2>2) Scope and Data Sources</h2>
+<p>Источники:
+- <code>https://goszakup.gov.kz/</code>
+- <code>https://goszakup.gov.kz/ru/developer/ows_v3</code></p>
+<p>Целевая глубина:
+- 2024, 2025, 2026.</p>
+<p>Целевой набор организаций:
+- 27 BIN (зафиксированы в конфиге/документации проекта).</p>
+<hr />
+<h2>3) Final Architecture</h2>
+<pre><code class="language-text">OWS v3
+ -&gt; ETL workers (async, checkpointed)
+ -&gt; PostgreSQL (source of truth)
+ -&gt; Parquet export
+ -&gt; DuckDB marts
+ -&gt; Analytics API
+ -&gt; Agent API (strict tools)
+ -&gt; Streamlit UI
+</code></pre>
+<p>Компоненты:
+- PostgreSQL: нормализованное хранилище с FK и lineage.
+- DuckDB: быстрые аналитические витрины.
+- Redis: response cache / runtime cache.
+- FastAPI:
+  - analytics endpoints;
+  - agent endpoints (<code>/query</code>, <code>/ask</code>, <code>/tools</code>).
+- Streamlit UI (<code>:8501</code>) для экспертной проверки.</p>
+<hr />
+<h2>4) Data Engineering Delivery</h2>
+<h2>4.1 Core schema</h2>
+<p>Минимальный охват ТЗ выполнен:
+- объявления;
+- план;
+- договоры;
+- лоты;
+- заказчики/поставщики;
+- статусы;
+- справочники.</p>
+<p>Ключевые таблицы:
+- <code>subjects</code>, <code>plan_points</code>, <code>announcements</code>, <code>lots</code>, <code>contracts</code>, <code>contract_items</code>, <code>lot_plan_points</code>.
+- refs: <code>enstru_ref</code>, <code>units_ref</code>, <code>kato_ref</code>, статусы/методы.
+- operational: <code>etl_state</code>, <code>etl_runs</code>, <code>journal_entries</code>, <code>quality_snapshots</code>.</p>
+<h2>4.2 ETL quality model</h2>
+<ul>
+<li>idempotent upsert;</li>
+<li>resume-by-checkpoint в <code>etl_state</code>;</li>
+<li>finite backstep для безопасного восстановления;</li>
+<li>incremental workers для high-volume endpoint’ов;</li>
+<li>strict verification scripts (<code>verify_spiral2</code>, <code>verify_spiral3</code>).</li>
+</ul>
+<h2>4.3 Incremental &lt;24h</h2>
+<ul>
+<li><code>load_journal_incremental.py</code> + daily runner;</li>
+<li>загружаются только изменившиеся сущности;</li>
+<li>обновляются аналитические витрины.</li>
+</ul>
+<hr />
+<h2>5) Analytics Methodology</h2>
+<h2>5.1 Fair Price</h2>
+<p>Метод:
+- baseline: median unit price по сопоставимым объектам;
+- time factor: <code>K_time</code> (CPI/macro indices);
+- region factor: применяется при наличии региональных данных;
+- volume factor: placeholder <code>K_vol=1.0</code> (осознанно отключен в MVP).</p>
+<p>Fallback ladder:
+1. region + period
+2. national + period
+3. region ±1 year
+4. national ±1 year</p>
+<p>Вердикт:
+- <code>anomaly</code>, если отклонение <code>&gt;30%</code>;
+- <code>insufficient_data</code>, если <code>N &lt; 20</code> на всех уровнях.</p>
+<h2>5.2 Anomaly detection</h2>
+<ul>
+<li>price anomalies: deviation threshold + confidence layers;</li>
+<li>volume anomalies: YoY ratio на <code>volume_anomalies</code>.</li>
+</ul>
+<h2>5.3 Explainability</h2>
+<p>Каждый результат содержит:
+- параметры;
+- статистику (<code>N</code>, median/percentiles/ratio...);
+- метод;
+- уверенность;
+- ограничения;
+- Top-K с ID и ссылками.</p>
+<hr />
+<h2>6) Agentic AI Design (Risk-Controlled)</h2>
+<p>Принцип:
+- LLM не имеет raw DB доступа;
+- LLM не генерирует SQL;
+- только whitelist функций с параметрической валидацией.</p>
+<p>8 intent types:
+- <code>PRICE_CHECK</code>, <code>ORG_SUMMARY</code>, <code>ANOMALY_SCAN</code>, <code>SUPPLIER_CHECK</code>, <code>AUDIT_TRAIL</code>, <code>PLAN_VS_FACT</code>, <code>TOP_K</code>, <code>COVERAGE_GAPS</code>.</p>
+<p>Ответы формируются в структуре L0-L4:
+- L0 verdict;
+- L1 параметры;
+- L2 аналитика;
+- L3 примеры;
+- L4 evidence/ограничения.</p>
+<hr />
+<h2>7) Current Technical Status (as-is)</h2>
+<p>Интеграция:
+- <code>verify_spiral2.py</code>: FK и duplicate checks проходят.
+- <code>verify_spiral3.py</code>: analytics marts построены и не пусты.</p>
+<p>Ключевой факт для комиссии:
+- платформа архитектурно готова и воспроизводима;
+- основной remaining gap связан не с логикой агента, а с полнотой отдельных данных ingestion.</p>
+<hr />
+<h2>8) Compliance Matrix (Technical Task)</h2>
+<table>
+<thead>
+<tr>
+<th>Требование</th>
+<th>Статус</th>
+<th>Комментарий</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Полный цикл DE + AI</td>
+<td>DONE</td>
+<td>ETL + schema + marts + agent + UI</td>
+</tr>
+<tr>
+<td>Проверяемые ответы</td>
+<td>DONE</td>
+<td>Structured output + evidence links</td>
+</tr>
+<tr>
+<td>Обязательные классы вопросов</td>
+<td>DONE</td>
+<td>Fair/Anomaly/Volume покрыты</td>
+</tr>
+<tr>
+<td>Explainability</td>
+<td>DONE</td>
+<td>N, method, confidence, limits, Top-K</td>
+</tr>
+<tr>
+<td>Инкрементальное обновление</td>
+<td>DONE</td>
+<td>Journal-based incremental</td>
+</tr>
+<tr>
+<td>Защита от домысливания</td>
+<td>DONE</td>
+<td>Tool whitelist, no free SQL</td>
+</tr>
+<tr>
+<td>Accuracy &gt;=85% facts</td>
+<td>IN PROGRESS</td>
+<td>Требуется формальный benchmark-report</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>9) Risks and Mitigations</h2>
+<p>Основные риски:
+- неполное покрытие некоторых полей (KATO/ENSTRU linkage по части сущностей);
+- ограниченный объем <code>contract_items</code> для статистической мощности;
+- зависимость от стабильности OWS schema.</p>
+<p>Митигирующие меры уже внедрены:
+- checkpointed ETL;
+- strict recovery flows;
+- quality snapshots;
+- deterministic analytics without LLM math.</p>
+<hr />
+<h2>10) Final Demo Narrative (for reviewers)</h2>
+<ol>
+<li>Показать архитектуру и boundaries (2 минуты).</li>
+<li>Показать data integrity checks (1 минута).</li>
+<li>Запустить 3 обязательных кейса (4 минуты):
+   - fairness by lot;
+   - anomaly by ENSTRU/year;
+   - volume anomaly by ENSTRU/year.</li>
+<li>Показать audit trail и evidence links (1 минута).</li>
+<li>Показать incremental update path (1 минута).</li>
+</ol>
+<p>Итог: демонстрация не «чат-ответов», а проверяемого аналитического инструмента для закупочного контроля.</p>
+<hr />
+<h2>11) Submission Package</h2>
+<p>Рекомендуемый набор:
+- <code>docs/SUBMISSION_FINAL_v2.docx</code> (этот документ)
+- <code>docs/SUBMISSION_FINAL.docx</code> (полная расширенная версия)
+- <code>docs/DEMO_SCRIPT_v2.docx</code> (сценарий защиты)
+- <code>docs/ARCHITECTURE.md</code>
+- <code>docs/DATA_SCHEMA.md</code>
+- <code>docs/ANALYTICS.md</code>
+- <code>docs/DEMO_CASES.md</code>
+- <code>artifacts/demo_cases/*.json</code></p>
+<hr />
+<h2>12) Conclusion</h2>
+<p>Проект реализован как контролируемый аналитический AI-agent с прозрачной вычислительной цепочкой, воспроизводимыми результатами и on-prem готовностью.</p>
+<p>Финальный инженерный фокус перед официальной сдачей:
+- повысить полноту ingestion для роста статистической силы;
+- зафиксировать benchmark точности извлечения фактов (&gt;=85%) в отдельном отчете.</p></body></html>

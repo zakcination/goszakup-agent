@@ -1,0 +1,512 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body{font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; line-height:1.45; font-size:12pt; color:#111;}
+h1{font-size:22pt; margin:0 0 12px 0;}
+h2{font-size:16pt; margin:18px 0 8px 0;}
+h3{font-size:13pt; margin:14px 0 6px 0;}
+code, pre{font-family: Menlo, Consolas, monospace; font-size:10pt;}
+pre{background:#f5f7fa; padding:8px; border:1px solid #dbe2ea;}
+table{border-collapse:collapse; width:100%; margin:8px 0;}
+th, td{border:1px solid #c8d1dc; padding:6px; vertical-align:top;}
+th{background:#eef2f7;}
+</style></head><body><h1>AI-Агент Анализа Госзакупок РК</h1>
+<h2>Финальная документация проекта (от старта до submission)</h2>
+<p>Версия: 1.0<br />
+Дата: 2026-03-02<br />
+Проект: <code>goszakup-agent</code></p>
+<hr />
+<h2>1. Резюме</h2>
+<p>Этот проект реализует полный цикл Data Engineering + AI Development для анализа закупок РК на базе OWS v3:
+- ingestion данных из OWS v3 в PostgreSQL;
+- нормализация и контроль качества;
+- аналитические витрины в DuckDB;
+- agentic API с tool whitelist (без free-form SQL);
+- демо-интерфейс на Streamlit с explainable ответами и Top-K evidence.</p>
+<p>Система поддерживает обязательные классы запросов ТЗ:
+- аномалии цен;
+- справедливость цены;
+- аномалии объемов.</p>
+<hr />
+<h2>2. Исходное ТЗ и охват</h2>
+<h3>2.1 Цель</h3>
+<p>Разработать аналитического AI-агента, который на данных OWS v3 формирует проверяемые ответы, выявляет аномалии и оценивает эффективность закупок.</p>
+<p>Источники:
+- <code>https://goszakup.gov.kz/</code>
+- <code>https://goszakup.gov.kz/ru/developer/ows_v3</code></p>
+<h3>2.2 Целевые организации (27 BIN)</h3>
+<pre><code class="language-text">000740001307, 020240002363, 020440003656, 030440003698,
+050740004819, 051040005150, 100140011059, 120940001946,
+140340016539, 150540000186, 171041003124, 210240019348,
+210240033968, 210941010761, 230740013340, 231040023028,
+780140000023, 900640000128, 940740000911, 940940000384,
+960440000220, 970940001378, 971040001050, 980440001034,
+981140001551, 990340005977, 990740002243
+</code></pre>
+<h3>2.3 Период</h3>
+<ul>
+<li>2024, 2025, 2026.</li>
+</ul>
+<hr />
+<h2>3. Эволюция реализации (Spiral 1 -&gt; Spiral 5)</h2>
+<h3>Spiral 1: Infra + базовая связность</h3>
+<p>Сделано:
+- Docker-инфраструктура: Postgres, Redis, Adminer.
+- Первичная схема БД.
+- Скрипт проверок окружения и connectivity.</p>
+<p>Ключевые файлы:
+- <code>docker-compose.yml</code>
+- <code>infra/postgres/init.sql</code>
+- <code>scripts/check_connections.py</code>
+- <code>setup.sh</code></p>
+<h3>Spiral 2: Основной ingestion + lineage</h3>
+<p>Сделано:
+- ETL-пайплайн:
+  - <code>etl/load_refs.py</code>
+  - <code>etl/load_plans.py</code>
+  - <code>etl/load_announcements.py</code>
+  - <code>etl/load_lots.py</code>
+  - <code>etl/load_contracts.py</code>
+  - <code>etl/load_contract_items.py</code>
+- Линковка <code>lot &lt;-&gt; plan_points</code> через <code>lot_plan_points</code>.
+- FK-safe helpers (<code>ensure_subject</code>, <code>ensure_enstru_ref</code>, <code>ensure_unit_ref</code>).
+- Multi-BIN и restart-safe ingestion через <code>etl_state</code>.
+- Верификация: <code>scripts/verify_spiral2.py</code>.</p>
+<h3>Spiral 3: Quality-first redesign + incremental workers</h3>
+<p>Сделано:
+- Высоконагруженные endpoint workers (incremental/checkpointed):
+  - <code>etl/load_plans_kato_incremental.py</code>
+  - <code>etl/load_plans_spec_incremental.py</code>
+  - <code>etl/load_acts_incremental.py</code>
+  - <code>etl/load_treasury_pay_incremental.py</code>
+  - <code>etl/load_trd_buy_process_events_incremental.py</code>
+- Raw landing tables для качества и последующего enrich.
+- Recovery scripts и strict repair flows.
+- Quality snapshots и gap checks.</p>
+<h3>Spiral 4: Analytics marts + APIs</h3>
+<p>Сделано:
+- Экспорт в Parquet + сборка DuckDB marts:
+  - <code>analytics/export_parquet.py</code>
+  - <code>analytics/build_marts.py</code>
+- Marts:
+  - <code>market_price_stats</code>
+  - <code>lot_fair_price_eval</code>
+  - <code>lot_anomalies</code>
+  - <code>volume_anomalies</code>
+  - <code>coverage_stats</code>
+- Аналитический API:
+  - <code>services/analytics_api/main.py</code></p>
+<h3>Spiral 5: Strict agentic workflow + submission UI</h3>
+<p>Сделано:
+- Strict agent workflow (intent -&gt; whitelisted tool -&gt; cache -&gt; response).
+- 8 intent types и Pydantic validation.
+- Запрет free-form SQL от LLM.
+- Explainable structured output L0-L4.
+- Submission-grade UI.</p>
+<p>Ключевые файлы:
+- <code>agent/intent.py</code>
+- <code>agent/tools.py</code>
+- <code>agent/agent.py</code>
+- <code>agent/schemas.py</code>
+- <code>api/app.py</code>
+- <code>services/ui/app.py</code></p>
+<hr />
+<h2>4. Архитектура решения</h2>
+<h2>4.1 High-level</h2>
+<pre><code class="language-text">OWS v3 API
+   -&gt; ETL (async, checkpointed, idempotent)
+   -&gt; PostgreSQL (source of truth)
+   -&gt; Parquet export
+   -&gt; DuckDB marts (analytics layer)
+   -&gt; Analytics API + Agent API
+   -&gt; Streamlit UI
+</code></pre>
+<h2>4.2 Компоненты</h2>
+<ul>
+<li>Хранилище истины: PostgreSQL.</li>
+<li>Кэш и быстрый response cache: Redis.</li>
+<li>OLAP слой: DuckDB.</li>
+<li>Agent API: FastAPI (<code>/query</code>, <code>/ask</code>, <code>/tools</code>, <code>/health</code>).</li>
+<li>Analytics API: FastAPI (<code>/fair-price</code>, <code>/anomaly</code>, <code>/search</code>, <code>/compare</code>, <code>/volume-anomaly</code>, ...).</li>
+<li>UI: Streamlit на <code>8501</code>.</li>
+</ul>
+<h2>4.3 On-prem готовность</h2>
+<ul>
+<li>Docker Compose уже используется как базовый on-prem runtime.</li>
+<li>Секреты вынесены в <code>.env</code>.</li>
+<li>Порты сервисов ограничены loopback (<code>127.0.0.1</code>).</li>
+</ul>
+<hr />
+<h2>5. Схема данных и связи</h2>
+<h2>5.1 Основные сущности (ядро ТЗ)</h2>
+<ul>
+<li><code>subjects</code> (заказчики/поставщики)</li>
+<li><code>plan_points</code> (план)</li>
+<li><code>announcements</code> (объявления/trd-buy)</li>
+<li><code>lots</code> (лоты)</li>
+<li><code>contracts</code> (договоры)</li>
+<li><code>contract_items</code> (позиции договора)</li>
+<li><code>lot_plan_points</code> (lineage связь lot-&gt;plan)</li>
+</ul>
+<h2>5.2 Справочники</h2>
+<ul>
+<li><code>enstru_ref</code>, <code>units_ref</code>, <code>kato_ref</code></li>
+<li><code>trade_methods_ref</code>, <code>lot_statuses_ref</code>, <code>contract_statuses_ref</code></li>
+</ul>
+<h2>5.3 Операционные таблицы</h2>
+<ul>
+<li><code>etl_state</code>, <code>etl_runs</code>, <code>journal_entries</code></li>
+<li><code>quality_snapshots</code>, <code>analytics_export_state</code>, <code>anomaly_flags</code></li>
+</ul>
+<h2>5.4 Raw landing для high-volume feed</h2>
+<ul>
+<li><code>raw_plans_kato</code></li>
+<li><code>raw_plans_spec</code></li>
+<li><code>raw_acts</code></li>
+<li><code>raw_treasury_pay</code></li>
+<li><code>raw_trd_buy_events</code></li>
+</ul>
+<h2>5.5 Критические связи</h2>
+<ul>
+<li><code>lots.announcement_id -&gt; announcements.id</code></li>
+<li><code>contracts.supplier_bin -&gt; subjects.bin</code></li>
+<li><code>lot_plan_points.plan_point_id -&gt; plan_points.id</code></li>
+<li><code>contract_items.contract_id -&gt; contracts.id</code></li>
+</ul>
+<hr />
+<h2>6. Endpoint coverage OWS v3</h2>
+<p>Используемые endpoint-группы:
+- <code>/v3/subject/biin/{bin}</code>
+- <code>/v3/plans/{bin}</code>
+- <code>/v3/plans/view/{id}</code>
+- <code>/v3/plans/kato</code>
+- <code>/v3/plans/spec</code>
+- <code>/v3/trd-buy/bin/{bin}</code>
+- <code>/v3/trd-buy/{id}</code>
+- <code>/v3/trd-buy/{id}/cancel</code>
+- <code>/v3/trd-buy/{id}/pause</code>
+- <code>/v3/lots/bin/{bin}</code>
+- <code>/v3/contract/customer/{bin}</code>
+- <code>/v3/contract/{id}/units</code>
+- <code>/v3/acts</code>
+- <code>/v3/treasury-pay</code>
+- <code>/v3/journal</code>
+- <code>/v3/refs/*</code></p>
+<hr />
+<h2>7. ETL и контроль качества</h2>
+<h2>7.1 Идемпотентность и резюмирование</h2>
+<ul>
+<li>Каждый ingestion worker пишет checkpoint в <code>etl_state</code>.</li>
+<li>Повторный запуск продолжает с checkpoint (+ finite backstep).</li>
+<li>Дубликаты предотвращаются UPSERT-логикой.</li>
+</ul>
+<h2>7.2 Устойчивость</h2>
+<ul>
+<li>Повторы запросов с retry/backoff.</li>
+<li>Обработка сетевых ошибок и частичных прогонов.</li>
+<li>Скрипты strict recovery для восстановления lineage и gaps.</li>
+</ul>
+<h2>7.3 Инкрементальность (&lt;24h)</h2>
+<ul>
+<li>Daily update через <code>etl/load_journal_incremental.py</code>.</li>
+<li>Обновляются только затронутые сущности.</li>
+<li>Далее обновляется аналитический слой.</li>
+</ul>
+<hr />
+<h2>8. Аналитический слой</h2>
+<h2>8.1 Fair Price (формализовано)</h2>
+<p>База:
+- медиана <code>unit_price</code> по сопоставимым <code>ENSTRU + unit + period + region</code>.</p>
+<p>Коэффициенты:
+- <code>K_time</code>: CPI adjustment по <code>macro_indices</code>.
+- <code>K_region</code>: пока 1.0 (ограничение текущего датасета).
+- <code>K_vol</code>: 1.0 (MVP placeholder).</p>
+<p>Fallback ladder:
+1. region + period
+2. national + period
+3. region ±1 year
+4. national ±1 year</p>
+<p>Порог аномалии:
+- <code>deviation_pct &gt; 30%</code>.</p>
+<p>Insufficient data:
+- при <code>N &lt; 20</code> на всех уровнях -&gt; structured <code>insufficient_data</code>.</p>
+<h2>8.2 Аномалии</h2>
+<ul>
+<li>Price anomalies: rule-based по <code>lot_anomalies</code>.</li>
+<li>Volume anomalies: YoY ratio по <code>volume_anomalies</code>.</li>
+</ul>
+<h2>8.3 Макро-параметры (согласованные константы)</h2>
+<ul>
+<li>2024: inflation 8.6%, GDP growth 5.0%</li>
+<li>2025: inflation 12.3%, GDP growth 6.5%</li>
+<li>2026: inflation 12.2%, GDP growth 4.7%</li>
+</ul>
+<hr />
+<h2>9. Agentic workflow</h2>
+<h2>9.1 Принцип</h2>
+<p>LLM не выполняет SQL и не получает сырые выгрузки.</p>
+<p>Пайплайн ответа:
+1. Intent classification.
+2. Валидация параметров (Pydantic schema).
+3. Tool selection из whitelist.
+4. Cache check.
+5. Tool execution (fixed SQL templates).
+6. Structured response assembly + verbalization.</p>
+<h2>9.2 8 intent types</h2>
+<ul>
+<li><code>PRICE_CHECK</code></li>
+<li><code>ORG_SUMMARY</code></li>
+<li><code>ANOMALY_SCAN</code></li>
+<li><code>SUPPLIER_CHECK</code></li>
+<li><code>AUDIT_TRAIL</code></li>
+<li><code>PLAN_VS_FACT</code></li>
+<li><code>TOP_K</code></li>
+<li><code>COVERAGE_GAPS</code></li>
+</ul>
+<h2>9.3 Tool whitelist</h2>
+<ul>
+<li><code>get_fair_price</code></li>
+<li><code>get_org_summary</code></li>
+<li><code>get_anomalies</code></li>
+<li><code>get_supplier_profile</code></li>
+<li><code>get_audit_trail</code></li>
+<li><code>get_plan_execution</code></li>
+<li><code>get_top_k</code></li>
+<li><code>get_uncontracted_plans</code></li>
+</ul>
+<h2>9.4 Explainability</h2>
+<p>Каждый ответ содержит:
+- verdict;
+- параметры;
+- аналитические показатели (N, method, threshold/fallback);
+- ограничения/уверенность;
+- Top-K с ID и ссылками.</p>
+<hr />
+<h2>10. UI и представление результатов</h2>
+<p>Реализовано в <code>services/ui/app.py</code>:
+- submission presets по обязательным классам ТЗ;
+- L0-L4 вкладки;
+- Top-K evidence cards;
+- отдельное anomaly list представление с join-enrichment полями:
+  - customer/supplier BIN и names,
+  - supplier RNU flag,
+  - ENSTRU name,
+  - delivery place/KATO,
+  - contract/announcement metadata,
+  - прямые ссылки.</p>
+<hr />
+<h2>11. Актуальный статус качества данных (на 2026-03-02)</h2>
+<p>Источник: <code>scripts/verify_spiral2.py</code>, <code>scripts/verify_spiral3.py</code>, <code>scripts/check_quality_gaps.py</code>.</p>
+<h2>11.1 Интеграция и целостность</h2>
+<pre><code class="language-text">plan_points:        31670
+announcements:      37178
+lots:               98156
+lot_plan_points:      967
+contracts:          14762
+contract_items:       713
+
+FK violations:
+- lots.announcement_id -&gt; announcements.id: 0
+- contracts.supplier_bin -&gt; subjects.bin: 0
+- lot_plan_points.plan_point_id -&gt; plan_points.id: 0
+
+Duplicates: 0 по всем ключевым сущностям
+</code></pre>
+<h2>11.2 Analytics coverage</h2>
+<pre><code class="language-text">macro_indices:      3
+market_price_stats: 348
+lot_fair_price_eval:712
+lot_anomalies:      24
+</code></pre>
+<h2>11.3 Gaps snapshot (ключевые)</h2>
+<pre><code class="language-text">lots_with_enstru:      1896 / 98156 (1.93%)
+lots_with_kato:       18536 / 98156 (18.88%)
+plan_points_with_kato:  866 / 31670 (2.73%)
+contract_items_total:    713
+</code></pre>
+<p>Вывод:
+- Слой целостности и воспроизводимости уже стабильный.
+- Основной лимит качества аналитики сейчас связан с неполной заполняемостью ENSTRU/KATO в лотах и малым <code>contract_items</code> покрытием.</p>
+<hr />
+<h2>12. Матрица соответствия ТЗ</h2>
+<table>
+<thead>
+<tr>
+<th>Требование ТЗ</th>
+<th>Статус</th>
+<th>Что реализовано</th>
+<th>Доказательство</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Полный цикл DE + AI</td>
+<td>PARTIAL</td>
+<td>ETL + analytics + agent + UI реализованы</td>
+<td><code>README.md</code>, <code>docs/*</code>, codebase</td>
+</tr>
+<tr>
+<td>Реляционная схема</td>
+<td>DONE</td>
+<td>Нормализованная PostgreSQL схема + FK</td>
+<td><code>infra/postgres/init.sql</code></td>
+</tr>
+<tr>
+<td>ETL очистка/нормализация</td>
+<td>DONE</td>
+<td>Normalization helpers, refs, quality workers</td>
+<td><code>etl/utils.py</code>, <code>etl/load_*.py</code></td>
+</tr>
+<tr>
+<td>Аналитический слой для LLM</td>
+<td>DONE</td>
+<td>DuckDB marts + analytics API</td>
+<td><code>analytics/*</code>, <code>services/analytics_api/main.py</code></td>
+</tr>
+<tr>
+<td>RU/KZ natural language</td>
+<td>PARTIAL</td>
+<td>RU полно, KZ поддерживается базово</td>
+<td><code>agent/intent.py</code>, UI demo</td>
+</tr>
+<tr>
+<td>Авто-тип вопроса</td>
+<td>DONE</td>
+<td>8 intent classifier</td>
+<td><code>agent/intent.py</code></td>
+</tr>
+<tr>
+<td>Фактический анализ данных</td>
+<td>DONE</td>
+<td>Tools используют SQL по marts</td>
+<td><code>agent/tools.py</code></td>
+</tr>
+<tr>
+<td>Explainable ответ</td>
+<td>DONE</td>
+<td>L0-L4, N/method/limitations/evidence</td>
+<td><code>agent/agent.py</code>, UI</td>
+</tr>
+<tr>
+<td>Аномалии &gt;30%</td>
+<td>DONE</td>
+<td><code>ANOMALY_SCAN</code>, <code>lot_anomalies</code></td>
+<td><code>agent/tools.py</code>, marts</td>
+</tr>
+<tr>
+<td>Справедливость по лоту</td>
+<td>DONE</td>
+<td>lot reference resolution + fair price</td>
+<td><code>get_fair_price</code></td>
+</tr>
+<tr>
+<td>Объемные аномалии</td>
+<td>DONE</td>
+<td>volume route + <code>volume_anomalies</code></td>
+<td><code>intent/tools/ui</code></td>
+</tr>
+<tr>
+<td>Инкрементальность &lt;24h</td>
+<td>DONE</td>
+<td>journal incremental + daily runner</td>
+<td><code>etl/load_journal_incremental.py</code>, <code>scripts/run_daily.sh</code></td>
+</tr>
+<tr>
+<td>Accuracy &gt;=85% facts</td>
+<td>IN_PROGRESS</td>
+<td>Архитектура не допускает SQL hallucination; formal benchmark pending</td>
+<td>требуется labeled set + automated score</td>
+</tr>
+<tr>
+<td>Top-K с прямыми ссылками</td>
+<td>DONE</td>
+<td>API URLs + portal links</td>
+<td>tool outputs, UI</td>
+</tr>
+<tr>
+<td>Защита токенов API</td>
+<td>DONE</td>
+<td><code>.env</code> + no hardcoded secrets</td>
+<td><code>.env.example</code>, scripts</td>
+</tr>
+<tr>
+<td>On-prem readiness</td>
+<td>DONE</td>
+<td>Docker Compose deployment</td>
+<td><code>docker-compose.yml</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>13. Риски и ограничения</h2>
+<ol>
+<li>Низкое покрытие <code>contract_items</code> (713) ограничивает статистическую силу Fair Price.</li>
+<li>Неполная KATO заполняемость снижает региональную точность и повышает долю national fallback.</li>
+<li>Для части ENSTRU отсутствует описание в <code>enstru_ref</code> (<code>UNKNOWN</code>) из-за источника.</li>
+<li>KPI "accuracy &gt;=85%" требует отдельного labeled benchmark набора (20-50 запросов) и формальной оценки.</li>
+<li>Поддержка сложных KZ-формулировок пока слабее RU (нужен усиленный NLU слой).</li>
+</ol>
+<hr />
+<h2>14. План финального hardening перед отправкой</h2>
+<ol>
+<li>Довести <code>contract_items_total</code> до целевого уровня (<code>&gt;= 8000</code>) через расширенный replay + targeted repair.</li>
+<li>Повысить <code>plan_points_with_kato</code> и <code>lots_with_enstru</code> через endpoint-specific backfills.</li>
+<li>Добавить benchmark script фактической точности (digits/dates/BIN exact match).</li>
+<li>Зафиксировать 3 demo-кейса с проверяемыми JSON snapshots и скриншотами UI.</li>
+<li>Обновить <code>docs/DEMO_CASES.md</code> final numbers после последнего refresh.</li>
+</ol>
+<hr />
+<h2>15. Операционный runbook</h2>
+<h3>15.1 Полный запуск</h3>
+<pre><code class="language-bash">./setup.sh
+python scripts/check_connections.py
+python scripts/run_spiral2.sh
+python etl/load_macro_indices.py
+python analytics/export_parquet.py
+python analytics/build_marts.py
+python scripts/verify_spiral2.py
+python scripts/verify_spiral3.py
+</code></pre>
+<h3>15.2 Daily incremental</h3>
+<pre><code class="language-bash">./scripts/run_daily.sh
+</code></pre>
+<h3>15.3 Demo services</h3>
+<pre><code class="language-bash">docker compose up -d analytics_api agent_api ui
+# UI: http://127.0.0.1:8501
+# Agent API: http://127.0.0.1:8002/tools
+</code></pre>
+<hr />
+<h2>16. Примеры обязательных demo-запросов</h2>
+<ol>
+<li>
+<p>Справедливость:
+<code>Оцени адекватность цены лота № 32899983 относительно аналогичных контрактов других ведомств в идентичном городе поставки</code></p>
+</li>
+<li>
+<p>Аномалии цены:
+<code>Найди закупки с отклонением цены &gt;30% по ЕНСТРУ 331312.100.000000 за 2024 год</code></p>
+</li>
+<li>
+<p>Объемы:
+<code>Выяви нетипичное завышение количества ТРУ по сравнению с предыдущими годами по ЕНСТРУ 172213.000.000002 за 2025 год</code></p>
+</li>
+<li>
+<p>Audit trail:
+<code>История договора №24764966</code></p>
+</li>
+</ol>
+<hr />
+<h2>17. Состав submission пакета</h2>
+<p>Рекомендуемый комплект файлов:
+- <code>docs/SUBMISSION_FINAL.md</code> (этот документ)
+- <code>docs/ARCHITECTURE.md</code>
+- <code>docs/DATA_SCHEMA.md</code>
+- <code>docs/ANALYTICS.md</code>
+- <code>docs/DEMO_CASES.md</code>
+- <code>docs/RISKS.md</code>
+- <code>artifacts/demo_cases/*.json</code>
+- <code>artifacts/quality_baseline_*.txt</code>
+- <code>artifacts/analytics_check_*.txt</code></p>
+<hr />
+<h2>18. Заключение</h2>
+<p>Проект доведен до рабочего end-to-end прототипа с воспроизводимым агентным контуром, explainable аналитикой и on-prem deployability.</p>
+<p>Текущий технический приоритет перед финальной подачей: нарастить полноту данных (<code>contract_items</code>, KATO/ENSTRU coverage), после чего зафиксировать формальный accuracy benchmark &gt;=85% и финальные демо-кейсы в неизменяемых артефактах.</p></body></html>

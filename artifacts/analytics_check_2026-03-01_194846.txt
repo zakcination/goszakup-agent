@@ -1,0 +1,28 @@
+Sun Mar  1 19:48:46 +05 2026
+  OK  macro_indices: 3
+  OK  contract_items: 713
+  OK  market_price_stats: 348
+  OK  lot_fair_price_eval: 712
+  OK  lot_anomalies: 24
+lots_total                                    97920
+lots_with_announcement                        17014 / 97920      ( 17.38%)
+lots_with_source_trd_buy_id                   14151 / 97920      ( 14.45%)
+lots_with_enstru                                937 / 97920      (  0.96%)
+lots_with_unit                                  937 / 97920      (  0.96%)
+lots_with_kato                                 7517 / 97920      (  7.68%)
+contracts_total                               11674
+contracts_with_announcement                    9857 / 11674      ( 84.44%)
+contracts_with_source_trd_buy_id              11674 / 11674      (100.00%)
+contract_items_total                            713
+contract_items_with_pln_point_id                713 / 713        (100.00%)
+contract_items_with_enstru_code                 712 / 713        ( 99.86%)
+contract_items_with_unit_code                   712 / 713        ( 99.86%)
+plan_points_total                             31670
+plan_points_with_kato                           866 / 31670      (  2.73%)
+kato_ref_rows                                 16764
+lot_plan_points_rows                            942
+raw_plans_kato_rows                             169
+raw_plans_spec_rows                             133
+raw_acts_rows                                   749
+raw_treasury_pay_rows                           100
+raw_trd_buy_events_rows                        2850

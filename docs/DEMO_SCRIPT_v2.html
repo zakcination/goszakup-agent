@@ -1,0 +1,81 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.45;font-size:12pt;color:#111;}
+h1{font-size:22pt;margin:0 0 12px 0;}
+h2{font-size:16pt;margin:18px 0 8px 0;}
+h3{font-size:13pt;margin:14px 0 6px 0;}
+code,pre{font-family:Menlo,Consolas,monospace;font-size:10pt;}
+pre{background:#f5f7fa;padding:8px;border:1px solid #dbe2ea;}
+table{border-collapse:collapse;width:100%;margin:8px 0;}
+th,td{border:1px solid #c8d1dc;padding:6px;vertical-align:top;}
+th{background:#eef2f7;}
+</style></head><body><h1>Demo Script v2 (7-10 minutes)</h1>
+<p>Дата: 2026-03-02<br />
+Цель: защитить решение по ТЗ как проверяемую аналитическую систему, а не только как чат.</p>
+<hr />
+<h2>0) Pre-flight (30 сек)</h2>
+<p>Открыть:
+- UI: <code>http://127.0.0.1:8501</code>
+- Agent tools: <code>http://127.0.0.1:8002/tools</code></p>
+<p>Коротко проговорить:
+- LLM не делает SQL;
+- все цифры считаются в tool layer и marts;
+- ответы имеют evidence links.</p>
+<hr />
+<h2>1) Data integrity gate (1 мин)</h2>
+<p>В терминале:</p>
+<pre><code class="language-bash">python scripts/verify_spiral2.py
+python scripts/verify_spiral3.py
+</code></pre>
+<p>Что сказать:
+- FK violations = 0;
+- duplicates = 0;
+- analytics tables не пусты.</p>
+<hr />
+<h2>2) Case A — Fairness (2 мин)</h2>
+<p>Запрос:
+<code>Оцени адекватность цены лота № 32899983 относительно аналогичных контрактов других ведомств в идентичном городе поставки</code></p>
+<p>Что показать:
+- Verdict + confidence;
+- <code>N</code>, method, fallback/scope;
+- Top-K comparables с ссылками.</p>
+<p>Что подчеркнуть:
+- если данных мало, система не придумывает цену, а возвращает <code>insufficient_data</code>.</p>
+<hr />
+<h2>3) Case B — Price Anomaly (2 мин)</h2>
+<p>Запрос:
+<code>Найди закупки с отклонением цены &gt;30% по ЕНСТРУ 331312.100.000000 за 2024 год</code></p>
+<p>Что показать:
+- Top-K anomaly list в UI (обогащенный joins);
+- customer/supplier BIN + name;
+- deviation, expected vs actual;
+- announcement/contract links.</p>
+<hr />
+<h2>4) Case C — Volume Anomaly (1.5 мин)</h2>
+<p>Запрос:
+<code>Выяви нетипичное завышение количества ТРУ по сравнению с предыдущими годами по ЕНСТРУ 172213.000.000002 за 2025 год</code></p>
+<p>Что показать:
+- YoY ratio и change %;
+- затронутые BIN;
+- evidence на plan points / related IDs.</p>
+<hr />
+<h2>5) Audit Traceability (1 мин)</h2>
+<p>Запрос:
+<code>История договора №24764966</code></p>
+<p>Что показать:
+- цепочку plan -&gt; announcement -&gt; lot -&gt; contract -&gt; acts (где доступно);
+- coverage ratio + ограничения;
+- прямые API/portal ссылки.</p>
+<hr />
+<h2>6) Incremental Freshness (1 мин)</h2>
+<p>Показать команду:</p>
+<pre><code class="language-bash">./scripts/run_daily.sh
+</code></pre>
+<p>Что сказать:
+- используются checkpointed workers и journal incremental;
+- SLA по актуализации проектно поддерживается архитектурой (&lt;24h).</p>
+<hr />
+<h2>7) Closing (30 сек)</h2>
+<p>Финальный месседж:
+- это не «болтающий LLM», а контролируемый аналитический pipeline;
+- каждое число воспроизводимо;
+- архитектура готова к on-prem и расширению.</p></body></html>

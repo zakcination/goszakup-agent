@@ -3,7 +3,7 @@ etl/load_subjects.py
 ─────────────────────
 Spiral 1 — ETL Step 1: Load Subjects
 
-Loads full profiles for all 27 target BINs from OWS v3 API
+Loads full profiles for TARGET_BINS from OWS v3 API
 and upserts them into the subjects table.
 Also checks each BIN against the RNU (bad suppliers) registry.
 
@@ -14,7 +14,7 @@ Expected output:
     ✅ 000740001307 — Департамент образования...
     ✅ 020240002363 — Управление здравоохранения...
     ...
-    ✅ Done: 27 subjects loaded, 0 in RNU
+    ✅ Done: N subjects loaded, 0 in RNU
 """
 
 import asyncio
@@ -28,7 +28,37 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from etl.client import OWSClient
-from etl.config import TARGET_BINS
+from etl.config import get_config
+
+# If not in venv, re-exec using local .venv python to ensure deps are available.
+def _maybe_reexec_in_venv() -> None:
+    if os.environ.get("VIRTUAL_ENV"):
+        return
+    venv_python = (Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python")
+    if not venv_python.exists():
+        return
+    if Path(sys.executable).resolve() == venv_python.resolve():
+        return
+    os.execv(str(venv_python), [str(venv_python), *sys.argv])
+
+
+_maybe_reexec_in_venv()
+
+# Load .env early so config is env-driven even when running locally.
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    load_dotenv = None
+
+env_file = Path(__file__).parent.parent / ".env"
+if load_dotenv:
+    load_dotenv(env_file, override=False)
+elif env_file.exists():  # fallback: minimal parser
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip())
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -84,15 +114,13 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
 async def load_subjects():
     import asyncpg
 
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError("DATABASE_URL not set — check your .env")
-
-    token = os.environ.get("OWS_TOKEN")
-    if not token:
-        raise RuntimeError("OWS_TOKEN not set — check your .env")
+    cfg = get_config()
 
     logger.info("Connecting to database...")
+    # Allow DATABASE_URL to use docker-compose hostname ("postgres") while running ETL on host.
+    db_url = cfg.db_url
+    if not Path("/.dockerenv").exists():
+        db_url = db_url.replace("@postgres:", "@localhost:")
     conn = await asyncpg.connect(db_url, timeout=15)
     logger.info("Database connected ✅")
 
@@ -101,8 +129,8 @@ async def load_subjects():
     rnu_count = 0
     t_start = time.monotonic()
 
-    async with OWSClient(token=token) as client:
-        for bin_ in TARGET_BINS:
+    async with OWSClient(token=cfg.ows_token, base_url=cfg.ows_base_url) as client:
+        for bin_ in cfg.target_bins:
             try:
                 # ── Fetch subject profile ─────────────────────────────────
                 subject = await client.get_subject_by_bin(bin_)
@@ -155,7 +183,7 @@ async def load_subjects():
     await conn.close()
 
     logger.info("─" * 50)
-    logger.info("✅ Done: %d/%d subjects loaded in %.1fs", inserted, len(TARGET_BINS), duration)
+    logger.info("✅ Done: %d/%d subjects loaded in %.1fs", inserted, len(cfg.target_bins), duration)
     logger.info("   RNU hits: %d | Errors: %d", rnu_count, errors)
 
     if errors > 0:
@@ -164,13 +192,4 @@ async def load_subjects():
 
 
 if __name__ == "__main__":
-    # Load .env if running locally
-    env_file = Path(__file__).parent.parent / ".env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, val = line.partition("=")
-                os.environ.setdefault(key.strip(), val.strip())
-
     asyncio.run(load_subjects())

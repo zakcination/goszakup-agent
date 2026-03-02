@@ -42,10 +42,23 @@ check_prerequisites() {
     docker ps >/dev/null 2>&1 || fail "Docker daemon not running. Start Docker Desktop."
     ok "Docker daemon running"
 
-    command -v python3 >/dev/null 2>&1 || fail "Python3 not found"
-    PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)"; then
-        ok "Python $PYTHON_VER"
+    # Prefer Python 3.12/3.11 for binary wheels (duckdb/pyarrow)
+    PYTHON_BIN=""
+    for cand in python3.12 python3.11 python3.10 python3; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            PYTHON_BIN="$cand"
+            break
+        fi
+    done
+    if [ -z "$PYTHON_BIN" ]; then
+        fail "Python3 not found"
+    fi
+    PYTHON_VER=$($PYTHON_BIN -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    if $PYTHON_BIN -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)"; then
+        ok "Python $PYTHON_VER ($PYTHON_BIN)"
+        if $PYTHON_BIN -c "import sys; sys.exit(0 if sys.version_info >= (3,13) else 1)"; then
+            warn "Python 3.13 detected — duckdb/pyarrow wheels may be missing. Prefer 3.12 for analytics."
+        fi
     else
         fail "Python >= 3.10 required (found $PYTHON_VER)"
     fi
@@ -93,8 +106,8 @@ setup_env() {
         echo -e "  ${BOLD}Required changes in .env:${RESET}"
         echo "    OWS_TOKEN=<your bearer token from goszakup.gov.kz>"
         echo "    POSTGRES_PASSWORD=<strong password>"
-        echo "    DATABASE_URL=postgresql://goszakup_user:<password>@postgres:5432/goszakup"
-        echo "    AI_API_KEY=<your nitec-ai.kz key>"
+        echo "    DATABASE_URL=postgresql://goszakup_user:<password>@localhost:5432/goszakup"
+        echo "    AI_API_KEY=<optional (Spiral 3+)>"
         echo ""
         echo -e "  ${YELLOW}Edit .env now, then re-run: ./setup.sh up${RESET}"
         exit 0
@@ -115,7 +128,7 @@ setup_python() {
     step "Setting up Python environment"
 
     if [ ! -d ".venv" ]; then
-        python3 -m venv .venv
+        ${PYTHON_BIN:-python3} -m venv .venv
         ok "Created .venv"
     else
         ok ".venv already exists"

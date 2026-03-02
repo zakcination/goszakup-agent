@@ -1,0 +1,32 @@
+{
+  "run_id": "quality_20260301_101626",
+  "metrics": {
+    "lots_total": 97920.0,
+    "lots_with_announcement": 3004.0,
+    "lots_with_source_trd_buy_id": 0.0,
+    "lots_with_enstru": 937.0,
+    "lots_with_kato": 0.0,
+    "contracts_total": 11649.0,
+    "contracts_with_announcement": 187.0,
+    "contracts_with_source_trd_buy_id": 0.0,
+    "contract_items_total": 487.0,
+    "contract_items_with_pln_point_id": 0.0,
+    "contract_items_with_enstru_code": 486.0,
+    "plan_points_total": 31670.0,
+    "plan_points_with_kato": 866.0,
+    "lot_plan_points_rows": 942.0,
+    "raw_plans_kato_rows": 50.0,
+    "raw_plans_spec_rows": 50.0,
+    "raw_acts_rows": 50.0,
+    "raw_treasury_pay_rows": 50.0,
+    "lots_with_announcement_pct": 3.0678104575163396,
+    "lots_with_source_trd_buy_id_pct": 0.0,
+    "lots_with_enstru_pct": 0.9569035947712419,
+    "lots_with_kato_pct": 0.0,
+    "contracts_with_announcement_pct": 1.6052880075542966,
+    "contracts_with_source_trd_buy_id_pct": 0.0,
+    "contract_items_with_pln_point_id_pct": 0.0,
+    "contract_items_with_enstru_code_pct": 99.7946611909651,
+    "plan_points_with_kato_pct": 2.734449005367856
+  }
+}
