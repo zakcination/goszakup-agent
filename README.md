@@ -132,6 +132,20 @@ Open: http://localhost:8080
 - Password: (from .env)
 - Database: `goszakup`
 
+### 7.1 Quick DB discovery (read-only)
+This prints reviewer-friendly DB facts (counts, freshness, null gaps, and small samples) and saves outputs under `artifacts/`.
+```bash
+./scripts/discover_databases.sh --samples 5
+```
+Outputs:
+- `artifacts/db_discovery_<timestamp>/postgres.txt`
+- `artifacts/db_discovery_<timestamp>/duckdb.txt`
+
+For a deeper “pandas-style” snapshot (tables/columns/null ratios/describe) into `artifacts/db_snapshot_<timestamp>/`:
+```bash
+python scripts/profile_database_snapshot.py
+```
+
 ### 8. Spiral 3 analytics (macro indices → Parquet → marts)
 
 Option A (host-run, requires full deps):
@@ -242,10 +256,15 @@ goszakup-agent/
 │
 └── scripts/
     ├── check_connections.py  ← verify all connections work
+    ├── discover_databases.sh ← discover Postgres + DuckDB (read-only) + save artifacts
+    ├── discover_postgres.py  ← explore Postgres (counts, null gaps, samples)
+    ├── discover_duckdb.py    ← explore DuckDB marts (counts, schema, samples)
+    ├── profile_database_snapshot.py ← deeper “pandas-style” DB snapshot to artifacts/
     ├── run_spiral2.sh        ← full Spiral 2 runner
     ├── run_recovery_strict.sh← strict recovery runner
     ├── capture_quality_snapshot.py ← stores quality metrics in DB + artifacts JSON
-    └── verify_spiral2.py     ← Spiral 2 verification checks
+    ├── verify_spiral2.py     ← Spiral 2 verification checks
+    └── verify_spiral3.py     ← Spiral 3 verification checks (marts coverage)
 ```
 
 ---

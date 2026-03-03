@@ -41,6 +41,9 @@ volumes/
 logs/
 *.log
 
+# ── Generated artifacts (ephemeral) ───────────────────────────────────────────
+artifacts/db_discovery_*/
+
 # ── Airflow (generated) ───────────────────────────────────────────────────────
 airflow/logs/
 airflow/plugins/
