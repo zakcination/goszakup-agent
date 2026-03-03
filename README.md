@@ -50,6 +50,15 @@ API (OWS v3) → ETL (Python) → PostgreSQL → ✅ Verified
 cd goszakup-agent
 ```
 
+### 1.1 Launch demo services (recommended for reviewers)
+```bash
+./scripts/launch_demo.sh
+```
+Open:
+- UI: http://127.0.0.1:8501
+- Agent API: http://127.0.0.1:8002/docs
+- Analytics API: http://127.0.0.1:8001/docs
+
 ### 2. Run setup (checks everything + starts Docker)
 ```bash
 chmod +x setup.sh
